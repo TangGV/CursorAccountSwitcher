@@ -1,0 +1,18 @@
+<Window x:Class="CursorAccountSwitcher.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="Cursor 账号切换器"
+        Height="640" Width="720"
+        MinHeight="480" MinWidth="640"
+        WindowStartupLocation="CenterScreen"
+        Background="#FF1A1A1C"
+        UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display"
+        Icon="assets/app.ico"
+        FontFamily="Microsoft YaHei UI, Segoe UI">
+
+    <Grid Margin="0">
+        <wv2:WebView2 x:Name="Browser" DefaultBackgroundColor="#FF1A1A1C" />
+    </Grid>
+</Window>

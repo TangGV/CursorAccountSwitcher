@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cursor 账号切换器</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 顶部 -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 256 256" width="38" height="38">
+            <defs>
+              <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#6E9BFF" />
+                <stop offset="100%" stop-color="#7B5CE8" />
+              </linearGradient>
+            </defs>
+            <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#g1)" />
+            <circle cx="168" cy="104" r="18" fill="#ffffff" fill-opacity="0.42" />
+            <path d="M133 122a30 30 0 0 1 60 0v22h-60z" fill="#ffffff" fill-opacity="0.42" />
+            <circle cx="96" cy="108" r="21" fill="#fff" />
+            <path d="M61 131a35 35 0 0 1 70 0v22H61z" fill="#fff" />
+            <rect x="70" y="188" width="116" height="16" rx="8" fill="#fff" />
+            <path d="M52 196l30-17v34z" fill="#fff" />
+            <path d="M204 196l-30-17v34z" fill="#fff" />
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>账号切换器</h1>
+          <p id="subtitle">正在读取环境…</p>
+        </div>
+      </div>
+
+      <div class="top-actions">
+        <button id="btnRefresh" class="btn ghost" title="重新读取登录信息与运行状态">刷新状态</button>
+        <button id="btnAdd" class="btn primary">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          添加账号
+        </button>
+      </div>
+    </header>
+
+    <!-- 账号列表 -->
+    <main id="list" class="list"></main>
+
+    <!-- 底部 -->
+    <footer class="footer">
+      <div class="footer-left">
+        <span id="stats" class="stats">—</span>
+      </div>
+      <div class="footer-right">
+        <label class="switch" title="用 Agent 面板（--glass）还是传统编辑器窗口（--classic）启动。关=Agent 面板，开=编辑器窗口">
+          <input type="checkbox" id="prefEditorMode" />
+          <span class="track"><span class="knob"></span></span>
+          <span class="switch-label">编辑器模式</span>
+        </label>
+        <label class="switch" title="把主账号的 settings.json / 快捷键 / 代码片段复制到其他账号；你在某个账号里自己改过的设置会被保留">
+          <input type="checkbox" id="prefSyncSettings" />
+          <span class="track"><span class="knob"></span></span>
+          <span class="switch-label">同步设置</span>
+        </label>
+        <label class="switch" title="把主账号的最近项目、终端历史、编辑器布局填充到其他账号（仅在目标为空时填充）">
+          <input type="checkbox" id="prefSyncSession" />
+          <span class="track"><span class="knob"></span></span>
+          <span class="switch-label">同步会话</span>
+        </label>
+        <button id="btnPrefs" class="link">设置文件</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- 更多操作菜单 -->
+  <div id="menu" class="menu" hidden>
+    <div class="menu-item" data-act="openProject">用这个账号打开项目…</div>
+    <div class="menu-sep" data-when="running"></div>
+    <div class="menu-item" data-act="activate" data-when="running">切换到该窗口</div>
+    <div class="menu-item danger" data-act="close" data-when="running">关闭这个实例</div>
+    <div class="menu-item" data-act="startLogin" data-when="idle">启动并登录</div>
+    <div class="menu-sep"></div>
+    <div class="menu-item" data-act="rename">重命名</div>
+    <div class="menu-item" data-act="openDir">打开数据目录</div>
+    <div class="menu-item" data-act="copyDir">复制数据目录路径</div>
+    <div class="menu-sep" data-when="removable"></div>
+    <div class="menu-item danger" data-act="remove" data-when="removable">移除账号</div>
+  </div>
+
+  <!-- 输入框弹窗 -->
+  <div id="modal" class="modal-mask" hidden>
+    <div class="modal">
+      <h2 id="modalTitle">标题</h2>
+      <p id="modalDesc" class="modal-desc" hidden></p>
+      <input id="modalInput" class="input" type="text" />
+      <div id="modalBody" class="modal-body" hidden></div>
+      <div class="modal-actions">
+        <button id="modalCancel" class="btn ghost">取消</button>
+        <button id="modalOk" class="btn primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
