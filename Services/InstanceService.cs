@@ -18,43 +18,81 @@ public static class InstanceService
         Editor,
     }
 
-    /// <summary>统计使用指定数据目录的 Cursor 主进程数（0 或 1，异常情况下可能更多）。</summary>
-    public static int CountProcesses(string userDataDir, string defaultDataDir) =>
-        CursorProcesses.Enumerate()
+    /// <summary>统计使用指定数据目录的主进程数（0 或 1，异常情况下可能更多）。</summary>
+    public static int CountProcesses(string userDataDir, string defaultDataDir, string processName = "Cursor.exe") =>
+        CursorProcesses.Enumerate(processName)
             .Count(p => p.IsInstance && CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir));
 
-    /// <summary>启动某个数据目录对应的 Cursor 实例。openPath 非空时用它打开指定文件夹。</summary>
+    /// <summary>
+    /// 启动某个数据目录对应的实例。openPath 非空时用它打开指定文件夹。
+    /// mode 为空时不加 Cursor 的窗口参数。environment 非空时直接启动并把这些变量传给进程。
+    /// </summary>
     public static void Launch(
         string exePath,
         string userDataDir,
         string defaultDataDir,
-        WindowMode mode,
-        string? openPath = null)
+        WindowMode? mode,
+        string? openPath = null,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
         var isMain = CursorProcesses.PathsEqual(userDataDir, defaultDataDir);
+        var fullDataDir = Path.GetFullPath(userDataDir);
 
-        var args = new List<string>();
-        if (!isMain)
+        if (environment is null)
         {
-            args.Add($"--user-data-dir=\"{Path.GetFullPath(userDataDir)}\"");
-        }
+            var args = new List<string>();
+            if (!isMain)
+            {
+                args.Add($"--user-data-dir=\"{fullDataDir}\"");
+            }
 
-        // Agent 模式要显式 --glass，否则可能被上次的窗口偏好带回编辑器界面。
-        args.Add(mode == WindowMode.Agent ? "--glass" : "--classic");
+            if (mode is WindowMode windowMode)
+            {
+                // Agent 模式要显式 --glass，否则可能被上次的窗口偏好带回编辑器界面。
+                args.Add(windowMode == WindowMode.Agent ? "--glass" : "--classic");
+            }
 
-        if (!string.IsNullOrWhiteSpace(openPath))
-        {
-            args.Add("--new-window");
-            args.Add($"\"{openPath}\"");
+            if (!string.IsNullOrWhiteSpace(openPath))
+            {
+                if (mode is not null)
+                {
+                    args.Add("--new-window");
+                }
+
+                args.Add($"\"{openPath}\"");
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exePath,
+                Arguments = string.Join(' ', args),
+                UseShellExecute = true,
+                WorkingDirectory = Path.GetDirectoryName(exePath) ?? string.Empty,
+            });
+            return;
         }
 
         var startInfo = new ProcessStartInfo
         {
             FileName = exePath,
-            Arguments = string.Join(' ', args),
-            UseShellExecute = true,
+            UseShellExecute = false,
             WorkingDirectory = Path.GetDirectoryName(exePath) ?? string.Empty,
         };
+
+        if (!isMain)
+        {
+            startInfo.ArgumentList.Add($"--user-data-dir={fullDataDir}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(openPath))
+        {
+            startInfo.ArgumentList.Add(openPath);
+        }
+
+        foreach (var pair in environment)
+        {
+            startInfo.Environment[pair.Key] = pair.Value;
+        }
 
         Process.Start(startInfo);
     }
@@ -63,11 +101,24 @@ public static class InstanceService
     /// 关闭指定数据目录对应的 Cursor 实例。只关主进程，子进程会随之退出。
     /// 返回关闭的实例数。
     /// </summary>
-    public static int CloseProcesses(string userDataDir, string defaultDataDir)
+    public static int CloseProcesses(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
     {
+        var tracked = CursorProcesses.Enumerate(processName).ToList();
+        var mine = tracked
+            .Where(p => CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir))
+            .ToList();
+        var myPids = mine.Select(p => p.Pid).ToHashSet();
+
+        // 语言服务是另一个进程名，父进程属于这个数据目录时一起关掉。
+        var serverPids = processName.Equals("Antigravity.exe", StringComparison.OrdinalIgnoreCase)
+            ? CursorProcesses.Enumerate("language_server.exe")
+                .Where(p => myPids.Contains(p.ParentPid))
+                .Select(p => p.Pid)
+                .ToList()
+            : new List<int>();
+
         var killed = 0;
-        foreach (var process in CursorProcesses.Enumerate()
-                     .Where(p => p.IsInstance && CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir)))
+        foreach (var process in mine.Where(p => p.IsInstance))
         {
             try
             {
@@ -80,6 +131,23 @@ public static class InstanceService
 
                 proc.Kill(entireProcessTree: true);
                 killed++;
+            }
+            catch
+            {
+            }
+        }
+
+        foreach (var pid in serverPids)
+        {
+            try
+            {
+                using var proc = Process.GetProcessById(pid);
+                if (proc.HasExited)
+                {
+                    continue;
+                }
+
+                proc.Kill(entireProcessTree: true);
             }
             catch
             {

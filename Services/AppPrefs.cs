@@ -39,6 +39,9 @@ public sealed class AppPrefs
     /// <summary>启动前自动刷新登录信息。</summary>
     public bool RefreshOnLaunch { get; set; } = true;
 
+    /// <summary>界面当前选中的应用：cursor 或 antigravity。</summary>
+    public string ActiveApp { get; set; } = "cursor";
+
     public static AppPrefs Load()
     {
         try

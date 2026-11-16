@@ -36,9 +36,9 @@ public static class WindowActivator
     /// <summary>
     /// 找到属于指定数据目录的 Cursor 窗口并激活。找不到合适窗口时返回 false。
     /// </summary>
-    public static bool TryActivate(string userDataDir, string defaultDataDir)
+    public static bool TryActivate(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
     {
-        foreach (var process in CursorProcesses.Enumerate())
+        foreach (var process in CursorProcesses.Enumerate(processName))
         {
             if (!process.IsInstance || process.MainWindowHandle == IntPtr.Zero)
             {

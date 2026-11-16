@@ -13,21 +13,23 @@ namespace CursorAccountSwitcher.Services;
 /// </summary>
 public static class CursorProcesses
 {
-    public sealed record CursorProcess(int Pid, IntPtr MainWindowHandle, string? UserDataDir, bool IsInstance);
+    public sealed record CursorProcess(int Pid, int ParentPid, IntPtr MainWindowHandle, string? UserDataDir, bool IsInstance);
 
-    public static IEnumerable<CursorProcess> Enumerate()
+    public static IEnumerable<CursorProcess> Enumerate(string processName = "Cursor.exe")
     {
         var result = new List<CursorProcess>();
         try
         {
+            var safeName = processName.Replace("'", "");
             using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'Cursor.exe'");
+                "SELECT ProcessId, ParentProcessId, CommandLine FROM Win32_Process WHERE Name = '" + safeName + "'");
 
             foreach (var obj in searcher.Get())
             {
                 try
                 {
                     var pid = Convert.ToInt32(obj["ProcessId"] ?? 0);
+                    var parent = Convert.ToInt32(obj["ParentProcessId"] ?? 0);
                     var cmd = obj["CommandLine"] as string ?? string.Empty;
                     var isInstance = IsInstanceCommandLine(cmd);
 
@@ -41,7 +43,7 @@ public static class CursorProcesses
                     {
                     }
 
-                    result.Add(new CursorProcess(pid, handle, ExtractUserDataDir(cmd), isInstance));
+                    result.Add(new CursorProcess(pid, parent, handle, ExtractUserDataDir(cmd), isInstance));
                 }
                 catch
                 {

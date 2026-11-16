@@ -10,10 +10,10 @@
     <AssemblyName>CursorAccountSwitcher</AssemblyName>
     <RootNamespace>CursorAccountSwitcher</RootNamespace>
     <ApplicationIcon>assets\app.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
-    <Product>Cursor 账号切换器</Product>
-    <AssemblyTitle>Cursor 账号切换器</AssemblyTitle>
-    <Description>多账号并行运行 Cursor 的窗口管理器</Description>
+    <Version>1.2.0</Version>
+    <Product>账号切换器</Product>
+    <AssemblyTitle>账号切换器</AssemblyTitle>
+    <Description>多账号并行运行 Cursor 与 Antigravity</Description>
     <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
   </PropertyGroup>

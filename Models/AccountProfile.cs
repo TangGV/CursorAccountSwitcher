@@ -31,6 +31,16 @@ public sealed class AccountProfile : INotifyPropertyChanged
     /// <summary>是否为主档案（默认安装那一个，数据目录不可更改）。</summary>
     public bool IsMain { get; set; }
 
+    /// <summary>这个档案属于哪个应用。旧数据没有该字段时视为 Cursor。</summary>
+    [JsonConverter(typeof(AppKindJsonConverter))]
+    public AppKind App { get; set; } = AppKind.Cursor;
+
+    /// <summary>
+    /// Antigravity 副账号的独立用户目录。对话和登录文件放在该目录的 .gemini 下。
+    /// 主账号和 Cursor 为空，表示沿用真实用户目录。
+    /// </summary>
+    public string? HomeDir { get; set; }
+
     /// <summary>上次从该数据目录读到的登录邮箱，仅作展示与判断是否已登录。</summary>
     public string? CachedEmail
     {

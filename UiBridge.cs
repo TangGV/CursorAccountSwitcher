@@ -28,17 +28,12 @@ public sealed class UiBridge
     private readonly AppPrefs _prefs;
     private readonly DispatcherTimer _statusTimer;
 
-    private string? _exePath;
-    private CursorLocator.CursorInstall? _install;
-
     public UiBridge(Window window, CoreWebView2 core)
     {
         _window = window;
         _core = core;
         _prefs = AppPrefs.Load();
         _store = ProfileStore.Load();
-
-        ResolveInstall();
 
         _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         _statusTimer.Tick += (_, _) => _ = PushAsync();
@@ -47,7 +42,7 @@ public sealed class UiBridge
         window.Closed += (_, _) => _statusTimer.Stop();
     }
 
-    private static string DefaultDataDir => ProfileStore.DefaultDataDir;
+    private AppKind CurrentApp => AppCatalog.Parse(_prefs.ActiveApp);
 
     // ------------------------------------------------------------------ 桥
 
@@ -142,22 +137,39 @@ public sealed class UiBridge
 
     // ------------------------------------------------------------------ 设置
 
-    private object GetSettings() => new
+    private object GetSettings()
     {
-        syncSettings = _prefs.SyncSettingsFromMain,
-        syncSession = _prefs.SyncSessionFromMain,
-        useClassicWindow = _prefs.UseClassicWindow,
-        installPath = _exePath,
-        installVersion = _install?.Version ?? "",
-        installLabel = _exePath is null ? "" : Path.GetFileName(Path.GetDirectoryName(_exePath)),
-        otherVersions = OtherVersions(),
-    };
+        var cursorInstall = FindInstall(AppKind.Cursor);
+        var antigravityInstall = FindInstall(AppKind.Antigravity);
+        return new
+        {
+            activeApp = AppCatalog.ToKey(CurrentApp),
+            appLabel = "账号",
+            supportsWindowMode = true,
+            supportsSync = true,
+            syncSettings = _prefs.SyncSettingsFromMain,
+            syncSession = _prefs.SyncSessionFromMain,
+            useClassicWindow = _prefs.UseClassicWindow,
+            installPath = cursorInstall?.Path,
+            installVersion = cursorInstall?.Version ?? "",
+            installLabel = cursorInstall is null ? "" : Path.GetFileName(Path.GetDirectoryName(cursorInstall.Value.Path)),
+            otherVersions = OtherVersions(AppKind.Cursor, cursorInstall?.Path),
+            cursorVersion = cursorInstall?.Version ?? "",
+            antigravityPath = antigravityInstall?.Path,
+            antigravityVersion = antigravityInstall?.Version ?? "",
+        };
+    }
 
-    private List<string> OtherVersions()
+    private List<string> OtherVersions(AppKind app, string? chosenPath)
     {
-        if (_install is null) return new List<string>();
-        return CursorLocator.CollectInstalls()
-            .Where(i => !PathsEqual(i.ExePath, _install.ExePath))
+        if (chosenPath is null) return new List<string>();
+
+        IEnumerable<(string Path, string Version)> installs = app == AppKind.Antigravity
+            ? AntigravityLocator.CollectInstalls().Select(i => (i.ExePath, i.Version))
+            : CursorLocator.CollectInstalls().Select(i => (i.ExePath, i.Version));
+
+        return installs
+            .Where(i => !PathsEqual(i.Path, chosenPath))
             .Select(i => i.Version)
             .Where(v => !string.IsNullOrWhiteSpace(v))
             .Distinct()
@@ -174,6 +186,8 @@ public sealed class UiBridge
                 _prefs.SyncSessionFromMain = b.GetBoolean();
             if (arg.TryGetProperty("useClassicWindow", out var c) && c.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 _prefs.UseClassicWindow = c.GetBoolean();
+            if (arg.TryGetProperty("activeApp", out var app) && app.ValueKind == JsonValueKind.String)
+                _prefs.ActiveApp = AppCatalog.ToKey(AppCatalog.Parse(app.GetString()));
             _prefs.Save();
         }
         return new { ok = true };
@@ -189,16 +203,24 @@ public sealed class UiBridge
                    && arg.TryGetProperty("deep", out var d)
                    && d.ValueKind == JsonValueKind.True;
 
-        var items = _store.Profiles.Select(p => ToDto(p, deep)).ToList();
-        return Task.FromResult<object?>(items);
+        return Task.FromResult<object?>(ListDtos(deep));
     }
+
+    private List<object> ListDtos(bool deep) =>
+        _store.Profiles
+            .Select((profile, index) => (profile, index))
+            .OrderBy(x => x.profile.App == AppKind.Antigravity ? 1 : 0)
+            .ThenBy(x => x.profile.IsMain ? 0 : 1)
+            .ThenBy(x => x.index)
+            .Select(x => ToDto(x.profile, deep))
+            .ToList();
 
     /// <summary>定时把状态推给前端（保持卡片上的运行状态实时）。</summary>
     private async Task PushAsync()
     {
         try
         {
-            var items = _store.Profiles.Select(p => ToDto(p, deep: false)).ToList();
+            var items = ListDtos(deep: false);
             var json = JsonSerializer.Serialize(items, Json);
             var script = $"window.__updateList && window.__updateList({JsonSerializer.Serialize(json)});";
             await _core.ExecuteScriptAsync(script);
@@ -211,20 +233,29 @@ public sealed class UiBridge
 
     private object ToDto(AccountProfile p, bool deep)
     {
-        var count = InstanceService.CountProcesses(p.DataDir, DefaultDataDir);
+        var count = InstanceService.CountProcesses(p.DataDir, DefaultDir(p), ProcessName(p));
         var isRunning = count > 0;
 
         if (deep)
         {
-            var info = StateDbReader.Read(p.DataDir);
-            p.CachedEmail = info?.Email;
-            p.Membership = info?.Membership;
+            if (p.App == AppKind.Antigravity)
+            {
+                p.CachedEmail = AntigravityLoginReader.ReadUsername(p.DataDir);
+                p.Membership = null;
+            }
+            else
+            {
+                var info = StateDbReader.Read(p.DataDir);
+                p.CachedEmail = info?.Email;
+                p.Membership = info?.Membership;
+            }
         }
 
         return new
         {
             id = p.Id,
             name = p.Name,
+            app = AppCatalog.ToKey(p.App),
             dataDir = p.DataDir,
             isMain = p.IsMain,
             isRunning,
@@ -260,18 +291,11 @@ public sealed class UiBridge
     {
         var profile = FindProfile(id);
 
-        if (_exePath is null)
-        {
-            ResolveInstall();
-            if (_exePath is null)
-            {
-                throw new InvalidOperationException("没找到 Cursor 的安装位置。");
-            }
-        }
+        var exe = RequireExe(profile.App);
 
-        if (InstanceService.CountProcesses(profile.DataDir, DefaultDataDir) > 0)
+        if (InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) > 0)
         {
-            WindowActivator.TryActivate(profile.DataDir, DefaultDataDir);
+            WindowActivator.TryActivate(profile.DataDir, DefaultDir(profile), ProcessName(profile));
             return new { message = $"「{profile.Name}」已经在运行，已切换到它的窗口。" };
         }
 
@@ -279,7 +303,12 @@ public sealed class UiBridge
 
         try
         {
-            InstanceService.Launch(_exePath, profile.DataDir, DefaultDataDir, CurrentWindowMode());
+            InstanceService.Launch(
+                exe,
+                profile.DataDir,
+                DefaultDir(profile),
+                WindowModeFor(profile),
+                environment: AppCatalog.IsolatedEnvironment(profile));
         }
         catch (Exception ex)
         {
@@ -293,6 +322,18 @@ public sealed class UiBridge
     /// <summary>启动前准备：确保目录存在，按偏好同步设置与会话。</summary>
     private void PrepareDataDir(AccountProfile profile)
     {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(profile.HomeDir))
+            {
+                Directory.CreateDirectory(profile.HomeDir);
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("创建数据目录失败：" + ex.Message);
+        }
+
         if (profile.IsMain) return;
 
         try
@@ -304,9 +345,14 @@ public sealed class UiBridge
             throw new InvalidOperationException("创建数据目录失败：" + ex.Message);
         }
 
+        if (profile.App != AppKind.Cursor)
+        {
+            return;
+        }
+
         if (_prefs.SyncSettingsFromMain)
         {
-            var result = SettingsSync.SyncFromMain(DefaultDataDir, profile.DataDir, profile.SyncedHashes);
+            var result = SettingsSync.SyncFromMain(DefaultDir(profile), profile.DataDir, profile.SyncedHashes);
             if (result.Synced.Count > 0 || result.Skipped.Count > 0)
             {
                 _store.Save();
@@ -315,19 +361,19 @@ public sealed class UiBridge
 
         if (_prefs.SyncSessionFromMain)
         {
-            SessionSync.SyncFromMain(DefaultDataDir, profile.DataDir);
+            SessionSync.SyncFromMain(DefaultDir(profile), profile.DataDir);
         }
     }
 
     private object Activate(string id)
     {
         var profile = FindProfile(id);
-        if (InstanceService.CountProcesses(profile.DataDir, DefaultDataDir) == 0)
+        if (InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) == 0)
         {
             throw new InvalidOperationException($"「{profile.Name}」没有在运行。");
         }
 
-        if (!WindowActivator.TryActivate(profile.DataDir, DefaultDataDir))
+        if (!WindowActivator.TryActivate(profile.DataDir, DefaultDir(profile), ProcessName(profile)))
         {
             throw new InvalidOperationException($"没找到「{profile.Name}」的窗口，请从任务栏切换过去。");
         }
@@ -338,7 +384,7 @@ public sealed class UiBridge
     private Task<object?> CloseAsync(string id)
     {
         var profile = FindProfile(id);
-        var count = InstanceService.CloseProcesses(profile.DataDir, DefaultDataDir);
+        var count = InstanceService.CloseProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile));
         if (count == 0)
         {
             throw new InvalidOperationException($"没有找到「{profile.Name}」的运行实例。");
@@ -350,11 +396,7 @@ public sealed class UiBridge
     {
         var profile = FindProfile(id);
 
-        if (_exePath is null)
-        {
-            ResolveInstall();
-            if (_exePath is null) throw new InvalidOperationException("没找到 Cursor 的安装位置。");
-        }
+        var exe = RequireExe(profile.App);
 
         var dialog = new Microsoft.Win32.OpenFolderDialog
         {
@@ -367,7 +409,13 @@ public sealed class UiBridge
         }
 
         PrepareDataDir(profile);
-        InstanceService.Launch(_exePath, profile.DataDir, DefaultDataDir, CurrentWindowMode(), dialog.FolderName);
+        InstanceService.Launch(
+            exe,
+            profile.DataDir,
+            DefaultDir(profile),
+            WindowModeFor(profile),
+            dialog.FolderName,
+            AppCatalog.IsolatedEnvironment(profile));
         return Task.FromResult<object?>(new { message = "已发出打开请求" });
     }
 
@@ -385,7 +433,9 @@ public sealed class UiBridge
             throw new InvalidOperationException("名字不能为空。");
         }
 
-        var profile = _store.Add(name.Trim());
+        var requested = ArgString(arg, "app");
+        var app = string.IsNullOrWhiteSpace(requested) ? CurrentApp : AppCatalog.Parse(requested);
+        var profile = _store.Add(name.Trim(), app);
         return new { id = profile.Id, name = profile.Name };
     }
 
@@ -412,7 +462,7 @@ public sealed class UiBridge
             throw new InvalidOperationException("主账号不能移除。");
         }
 
-        if (InstanceService.CountProcesses(profile.DataDir, DefaultDataDir) > 0)
+        if (InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) > 0)
         {
             throw new InvalidOperationException("这个账号正在运行，请先关闭它再移除。");
         }
@@ -421,11 +471,12 @@ public sealed class UiBridge
                          && arg.TryGetProperty("deleteData", out var d)
                          && d.ValueKind == JsonValueKind.True;
 
-        if (deleteData && SafeExists(profile.DataDir))
+        var dataPath = AppCatalog.SandboxRoot(profile) ?? profile.DataDir;
+        if (deleteData && SafeExists(dataPath))
         {
             try
             {
-                Directory.Delete(profile.DataDir, recursive: true);
+                Directory.Delete(dataPath, recursive: true);
             }
             catch (Exception ex)
             {
@@ -442,14 +493,14 @@ public sealed class UiBridge
     private object OpenDir(string id)
     {
         var profile = FindProfile(id);
-        OpenPath(profile.DataDir);
+        OpenPath(AppCatalog.BrowseDir(profile));
         return new { ok = true };
     }
 
     private object CopyDir(string id)
     {
         var profile = FindProfile(id);
-        Clipboard.SetText(profile.DataDir);
+        Clipboard.SetText(AppCatalog.BrowseDir(profile));
         return new { ok = true };
     }
 
@@ -474,10 +525,36 @@ public sealed class UiBridge
 
     // ------------------------------------------------------------------ 安装定位
 
-    private void ResolveInstall()
+    private static string ProcessName(AccountProfile profile) => AppCatalog.ProcessName(profile.App);
+
+    private static string DefaultDir(AccountProfile profile) => AppCatalog.DefaultDataDir(profile.App);
+
+    private InstanceService.WindowMode? WindowModeFor(AccountProfile profile) =>
+        profile.App == AppKind.Cursor ? CurrentWindowMode() : null;
+
+    private string RequireExe(AppKind app)
     {
-        _install = CursorLocator.FindInstall();
-        _exePath = _install?.ExePath;
+        var install = FindInstall(app);
+        if (install is null)
+        {
+            throw new InvalidOperationException($"没找到 {AppCatalog.Label(app)} 的安装位置。");
+        }
+
+        return install.Value.Path;
+    }
+
+    private readonly record struct LocatedInstall(string Path, string Version);
+
+    private static LocatedInstall? FindInstall(AppKind app)
+    {
+        if (app == AppKind.Antigravity)
+        {
+            var found = AntigravityLocator.FindInstall();
+            return found is null ? null : new LocatedInstall(found.ExePath, found.Version);
+        }
+
+        var cursor = CursorLocator.FindInstall();
+        return cursor is null ? null : new LocatedInstall(cursor.ExePath, cursor.Version);
     }
 
     private static bool PathsEqual(string a, string b) =>

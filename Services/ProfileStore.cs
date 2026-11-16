@@ -47,10 +47,13 @@ public sealed class ProfileStore
         if (store.Profiles.Count == 0)
         {
             store.Profiles = CreateDefaultProfiles();
+        }
+
+        if (store.EnsureMains())
+        {
             store.Save();
         }
 
-        store.EnsureMainProfile();
         return store;
     }
 
@@ -61,30 +64,65 @@ public sealed class ProfileStore
             Name = "主账号",
             DataDir = DefaultDataDir,
             IsMain = true,
+            App = AppKind.Cursor,
         },
     };
 
-    /// <summary>始终保证存在且仅有一个主档案，并且它指向默认数据目录。</summary>
-    private void EnsureMainProfile()
+    /// <summary>Cursor 和 Antigravity 各保留一个主档案，并指回各自的默认数据目录。</summary>
+    private bool EnsureMains()
     {
-        var mains = Profiles.Where(p => p.IsMain).ToList();
+        var changed = false;
+        changed |= EnsureMain(AppKind.Cursor, insertAtStart: true);
+        changed |= EnsureMain(AppKind.Antigravity, insertAtStart: false);
+        return changed;
+    }
+
+    private bool EnsureMain(AppKind app, bool insertAtStart)
+    {
+        var changed = false;
+        var dataDir = AppCatalog.DefaultDataDir(app);
+        var mains = Profiles.Where(p => p.IsMain && p.App == app).ToList();
         if (mains.Count == 0)
         {
-            Profiles.Insert(0, new AccountProfile
+            var profile = new AccountProfile
             {
                 Name = "主账号",
-                DataDir = DefaultDataDir,
+                DataDir = dataDir,
                 IsMain = true,
-            });
-            return;
+                App = app,
+            };
+            if (insertAtStart)
+            {
+                Profiles.Insert(0, profile);
+            }
+            else
+            {
+                Profiles.Add(profile);
+            }
+
+            return true;
         }
 
         var main = mains[0];
-        main.DataDir = DefaultDataDir;
+        if (!string.Equals(main.DataDir, dataDir, StringComparison.OrdinalIgnoreCase))
+        {
+            main.DataDir = dataDir;
+            changed = true;
+        }
+
+        if (!string.IsNullOrEmpty(main.HomeDir))
+        {
+            main.HomeDir = null;
+            changed = true;
+        }
+
         foreach (var extra in mains.Skip(1))
         {
             extra.IsMain = false;
+            changed = true;
         }
+
+        return changed;
     }
 
     public void Save()
@@ -100,18 +138,26 @@ public sealed class ProfileStore
         }
     }
 
-    /// <summary>新增一个非主账号档案，数据目录放在 profiles 子目录下。</summary>
-    public AccountProfile Add(string name)
+    /// <summary>新增一个非主账号档案。Antigravity 另外带一个独立用户目录。</summary>
+    public AccountProfile Add(string name, AppKind app)
     {
         var id = Guid.NewGuid().ToString("N")[..8];
-        var dir = Path.Combine(AppPrefs.DefaultProfilesDir, id);
-
-        var profile = new AccountProfile
-        {
-            Name = name,
-            DataDir = dir,
-            IsMain = false,
-        };
+        var profile = app == AppKind.Antigravity
+            ? new AccountProfile
+            {
+                Name = name,
+                App = app,
+                DataDir = Path.Combine(AppCatalog.ProfilesDir(app), id, "userdata"),
+                HomeDir = Path.Combine(AppCatalog.ProfilesDir(app), id, "home"),
+                IsMain = false,
+            }
+            : new AccountProfile
+            {
+                Name = name,
+                App = AppKind.Cursor,
+                DataDir = Path.Combine(AppCatalog.ProfilesDir(AppKind.Cursor), id),
+                IsMain = false,
+            };
 
         Profiles.Add(profile);
         Save();

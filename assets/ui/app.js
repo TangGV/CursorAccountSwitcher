@@ -27,7 +27,7 @@ function host(method, arg) {
 window.__updateList = function (json) {
   let incoming;
   try { incoming = JSON.parse(json); } catch { return; }
-  if (!Array.isArray(incoming)) return;
+  if (!Array.isArray(incoming) || incoming.length === 0) return;
 
   // 账号集合变了（增/删）就整体重绘，否则只改状态。
   const sameShape =
@@ -81,7 +81,7 @@ window.__resolve = function (payloadJson) {
 // ---------------------------------------------------------------- 状态
 let accounts = [];
 let prefs = {};
-let settings = { useClassicWindow: false, syncSettings: true, syncSession: true };
+let settings = { activeApp: 'cursor', useClassicWindow: false, syncSettings: true, syncSession: true };
 let lastMenuAnchor = null;
 let menuAccountId = null;
 
@@ -130,30 +130,27 @@ function toast(msg, isErr = false) {
 // ---------------------------------------------------------------- 渲染
 function renderSubtitle() {
   const el = $('subtitle');
-  if (!settings.installPath) {
-    el.textContent = '未找到 Cursor 安装路径';
-    el.classList.add('warn');
-    return;
-  }
-  const parts = [`启动使用 ${settings.installVersion ? 'v' + settings.installVersion + ' · ' : ''}${settings.installLabel || ''}`];
+  const cursorVer = settings.cursorVersion || settings.installVersion;
+  const parts = [
+    cursorVer ? `Cursor v${cursorVer}` : '未找到 Cursor',
+    settings.antigravityPath ? `Antigravity v${settings.antigravityVersion}` : '未找到 Antigravity',
+  ];
+  if (!settings.installPath || !settings.antigravityPath) el.classList.add('warn');
+  else el.classList.remove('warn');
   if (settings.otherVersions && settings.otherVersions.length) {
-    parts.push(`另检测到 ${settings.otherVersions.join(' / ')}，已忽略`);
+    parts.push(`另检测到 Cursor ${settings.otherVersions.join(' / ')}，已忽略`);
     el.classList.add('warn');
-  } else {
-    el.classList.remove('warn');
   }
-  if (settings.useClassicWindow) {
-    parts.push('编辑器模式');
-  } else {
-    parts.push('Agent 面板模式');
-  }
+  parts.push(settings.useClassicWindow ? '编辑器模式' : 'Agent 面板模式');
   el.textContent = parts.join('  ·  ');
 }
 
 function renderStats() {
   const running = accounts.filter((a) => a.isRunning).length;
   const logged = accounts.filter((a) => a.hasLogin).length;
-  const parts = [`${accounts.length} 个账号`, `${logged} 个已登录`];
+  const cursorN = accounts.filter((a) => (a.app || 'cursor') !== 'antigravity').length;
+  const agN = accounts.filter((a) => a.app === 'antigravity').length;
+  const parts = [`Cursor ${cursorN}`, `Antigravity ${agN}`, `${logged} 个已登录`];
   if (running) parts.push(`${running} 个实例运行中`);
   $('stats').textContent = parts.join(' · ');
 }
@@ -192,23 +189,28 @@ function cardHtml(a) {
     </div>`;
 }
 
+function groupHtml(app, title, hint) {
+  const items = accounts.filter((a) => (a.app || 'cursor') === app);
+  const note = items.length <= 1 ? `<div class="group-hint">${escapeHtml(hint)}</div>` : '';
+  return `
+    <section class="group">
+      <div class="group-head">
+        <h2>${escapeHtml(title)}</h2>
+        <button class="btn mini ghost" data-act="addApp" data-app="${app}">添加</button>
+      </div>
+      ${items.map(cardHtml).join('')}
+      ${note}
+    </section>`;
+}
+
 function render() {
   const list = $('list');
-
-  // 保留滚动位置
   const scrollTop = list.scrollTop;
-
-  const emptyHtml = accounts.length <= 1
-    ? `<div class="empty">
-         <div class="empty-mark">+</div>
-         <p>还没有配置第二个账号</p>
-         <span>点右上角「添加账号」为另一个 Cursor 账号建一个独立实例。</span>
-       </div>`
-    : '';
-
-  list.innerHTML = accounts.map(cardHtml).join('') + emptyHtml;
+  list.innerHTML = [
+    groupHtml('cursor', 'Cursor', '再添加一个账号，就会单独开一个 Cursor 进程。'),
+    groupHtml('antigravity', 'Antigravity', '主账号是现在正在用的登录。再添加一个账号，会另开进程，不会顶掉主账号。'),
+  ].join('');
   list.scrollTop = scrollTop;
-
   renderSubtitle();
   renderStats();
 }
@@ -333,6 +335,11 @@ document.addEventListener('click', async (e) => {
   const account = accounts.find((a) => a.id === id);
 
   switch (act) {
+    case 'addApp':
+      closeMenu();
+      await doAdd(t.dataset.app);
+      break;
+
     case 'launch':
       closeMenu();
       await doLaunch(account);
@@ -416,7 +423,7 @@ $('btnRefresh').addEventListener('click', async () => {
   }
 });
 
-$('btnAdd').addEventListener('click', doAdd);
+$('btnAdd').addEventListener('click', () => doAdd());
 $('btnPrefs').addEventListener('click', () => run('prefs', () => host('openPrefs'), '已打开设置目录'));
 
 $('prefSyncSettings').addEventListener('change', async (e) => {
@@ -495,7 +502,17 @@ async function doClose(account) {
   }
 }
 
-async function doAdd() {
+async function doAdd(presetApp) {
+  let app = presetApp === 'antigravity' ? 'antigravity' : presetApp === 'cursor' ? 'cursor' : '';
+  if (!app) {
+    const pick = await showModal({
+      title: '添加到哪个应用？',
+      choices: [{ label: 'Cursor' }, { label: 'Antigravity' }, { label: '取消' }],
+      okText: '继续',
+    });
+    if (!pick || pick.choice === 2) return;
+    app = pick.choice === 1 ? 'antigravity' : 'cursor';
+  }
   const r = await showModal({
     title: '给这个账号起个名字',
     value: suggestName(),
@@ -504,15 +521,21 @@ async function doAdd() {
   });
   if (!r) return;
   try {
-    const created = await host('add', { name: r.text });
+    const created = await host('add', { name: r.text, app });
     await refresh(false);
+    const ag = app === 'antigravity';
     const ask = await showModal({
       title: `已创建「${created.name}」`,
-      desc: '现在启动它并登录第二个账号吗？\n启动后在 Cursor 里点右上角头像 → Sign In 完成登录。',
+      desc: ag
+        ? '现在启动它并登录另一个 Google 账号吗？\n这是独立进程，登录不会顶掉主账号。'
+        : '现在启动它并登录第二个账号吗？\n启动后在 Cursor 里点右上角头像 → Sign In 完成登录。',
       choices: [{ label: '立即启动' }, { label: '稍后' }],
       okText: '继续',
     });
-    if (ask && ask.choice === 0) await doLaunch(created);
+    if (ask && ask.choice === 0) {
+      const full = accounts.find((a) => a.id === created.id) || created;
+      await doLaunch(full);
+    }
   } catch (err) {
     toast(String(err.message || err), true);
   }
