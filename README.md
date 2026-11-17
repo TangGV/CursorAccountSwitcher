@@ -79,16 +79,37 @@ UiBridge.cs                 WebView2 与本地服务之间的 JSON 桥
 assets/ui/                  index.html / app.css / app.js —— 全部界面
 Services/
   CursorLocator.cs          定位 Cursor 安装，多版本时选最新
+  AntigravityLocator.cs     定位 Antigravity 2.x（Antigravity.exe）
+  CodexLocator.cs           定位 Codex 桌面版（商店版 ChatGPT.exe）
   CursorProcesses.cs        枚举进程、解析 --user-data-dir、判断归属
   InstanceService.cs        启动 / 关闭实例
   WindowActivator.cs        Win32 窗口激活
-  StateDbReader.cs          只读 state.vscdb 取登录信息
+  StateDbReader.cs          只读 state.vscdb 取 Cursor 登录信息
+  AntigravityLoginReader.cs 读 app_storage.json 取 Antigravity 登录名
+  CodexLoginReader.cs       解析 auth.json 的 id_token 取 Codex 邮箱与套餐
+  CodexInstanceTracker.cs   记录 Codex 副实例 PID（命令行不带数据目录）
   SettingsSync.cs           设置文件同步（哈希保护）
   SessionSync.cs            UI 状态同步（白名单）
   ProfileStore.cs           账号档案 JSON 持久化
   AppPrefs.cs               应用偏好
+  AppCatalog.cs             三个应用的路径、进程名与隔离参数
 Models/AccountProfile.cs    账号档案模型
+Models/AppKind.cs           应用枚举与 JSON 转换
 ```
+
+## Antigravity 多账号
+
+副账号启动时同时做三件事：窗口数据用独立的 `--user-data-dir`、用户目录指向该账号的沙箱
+（对话和登录落在 `<沙箱>\.gemini`）、进程环境里带 `SSH_CONNECTION`，让语言服务把 token
+写成该目录下的文件，而不是机器上共享的那条 `gemini:antigravity` 凭据。主账号不改环境，
+继续用现有登录。旧版 VS Code 的「Antigravity IDE」与 2.x 独立版路径不同，本工具只支持后者。
+
+## Codex 多账号
+
+Codex 桌面版由 Microsoft Store 分发，会忽略 `--user-data-dir`，窗口状态只能共享。副账号
+通过 `CODEX_HOME` 隔离登录、会话与配置，主账号继续用 `~\.codex`。由于它的命令行里不带
+数据目录，切换器在启动时记下新出现的进程，用来判断某个副账号是否还在运行；从开始菜单
+另开的窗口会被当成主账号。
 
 ## License
 

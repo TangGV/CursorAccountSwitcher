@@ -134,8 +134,9 @@ function renderSubtitle() {
   const parts = [
     cursorVer ? `Cursor v${cursorVer}` : '未找到 Cursor',
     settings.antigravityPath ? `Antigravity v${settings.antigravityVersion}` : '未找到 Antigravity',
+    settings.codexPath ? `Codex v${settings.codexVersion}` : '未找到 Codex',
   ];
-  if (!settings.installPath || !settings.antigravityPath) el.classList.add('warn');
+  if (!settings.installPath || !settings.antigravityPath || !settings.codexPath) el.classList.add('warn');
   else el.classList.remove('warn');
   if (settings.otherVersions && settings.otherVersions.length) {
     parts.push(`另检测到 Cursor ${settings.otherVersions.join(' / ')}，已忽略`);
@@ -148,9 +149,10 @@ function renderSubtitle() {
 function renderStats() {
   const running = accounts.filter((a) => a.isRunning).length;
   const logged = accounts.filter((a) => a.hasLogin).length;
-  const cursorN = accounts.filter((a) => (a.app || 'cursor') !== 'antigravity').length;
+  const cursorN = accounts.filter((a) => (a.app || 'cursor') === 'cursor').length;
   const agN = accounts.filter((a) => a.app === 'antigravity').length;
-  const parts = [`Cursor ${cursorN}`, `Antigravity ${agN}`, `${logged} 个已登录`];
+  const codexN = accounts.filter((a) => a.app === 'codex').length;
+  const parts = [`Cursor ${cursorN}`, `Antigravity ${agN}`, `Codex ${codexN}`, `${logged} 个已登录`];
   if (running) parts.push(`${running} 个实例运行中`);
   $('stats').textContent = parts.join(' · ');
 }
@@ -209,6 +211,7 @@ function render() {
   list.innerHTML = [
     groupHtml('cursor', 'Cursor', '再添加一个账号，就会单独开一个 Cursor 进程。'),
     groupHtml('antigravity', 'Antigravity', '主账号是现在正在用的登录。再添加一个账号，会另开进程，不会顶掉主账号。'),
+    groupHtml('codex', 'Codex', '主账号是现在正在用的登录。再添加一个账号会另开窗口，用独立的登录目录，不会顶掉主账号。'),
   ].join('');
   list.scrollTop = scrollTop;
   renderSubtitle();
@@ -503,15 +506,15 @@ async function doClose(account) {
 }
 
 async function doAdd(presetApp) {
-  let app = presetApp === 'antigravity' ? 'antigravity' : presetApp === 'cursor' ? 'cursor' : '';
+  let app = ['antigravity', 'cursor', 'codex'].includes(presetApp) ? presetApp : '';
   if (!app) {
     const pick = await showModal({
       title: '添加到哪个应用？',
-      choices: [{ label: 'Cursor' }, { label: 'Antigravity' }, { label: '取消' }],
+      choices: [{ label: 'Cursor' }, { label: 'Antigravity' }, { label: 'Codex' }, { label: '取消' }],
       okText: '继续',
     });
-    if (!pick || pick.choice === 2) return;
-    app = pick.choice === 1 ? 'antigravity' : 'cursor';
+    if (!pick || pick.choice === 3) return;
+    app = pick.choice === 1 ? 'antigravity' : pick.choice === 2 ? 'codex' : 'cursor';
   }
   const r = await showModal({
     title: '给这个账号起个名字',
@@ -523,12 +526,14 @@ async function doAdd(presetApp) {
   try {
     const created = await host('add', { name: r.text, app });
     await refresh(false);
-    const ag = app === 'antigravity';
+    const hints = {
+      antigravity: '现在启动它并登录另一个 Google 账号吗？\n这是独立进程，登录不会顶掉主账号。',
+      codex: '现在启动它并登录另一个账号吗？\n会用独立的登录目录，不会顶掉主账号。',
+      cursor: '现在启动它并登录第二个账号吗？\n启动后在 Cursor 里点右上角头像 → Sign In 完成登录。',
+    };
     const ask = await showModal({
       title: `已创建「${created.name}」`,
-      desc: ag
-        ? '现在启动它并登录另一个 Google 账号吗？\n这是独立进程，登录不会顶掉主账号。'
-        : '现在启动它并登录第二个账号吗？\n启动后在 Cursor 里点右上角头像 → Sign In 完成登录。',
+      desc: hints[app],
       choices: [{ label: '立即启动' }, { label: '稍后' }],
       okText: '继续',
     });

@@ -6,29 +6,48 @@ namespace CursorAccountSwitcher.Services;
 /// <summary>Cursor 与 Antigravity 共用的路径、进程名和副账号隔离参数。</summary>
 public static class AppCatalog
 {
-    public static AppKind Parse(string? text) =>
-        string.Equals(text, "antigravity", StringComparison.OrdinalIgnoreCase)
-            ? AppKind.Antigravity
-            : AppKind.Cursor;
+    public static AppKind Parse(string? text) => text?.Trim().ToLowerInvariant() switch
+    {
+        "antigravity" => AppKind.Antigravity,
+        "codex" => AppKind.Codex,
+        _ => AppKind.Cursor,
+    };
 
-    public static string ToKey(AppKind kind) =>
-        kind == AppKind.Antigravity ? "antigravity" : "cursor";
+    public static string ToKey(AppKind kind) => kind switch
+    {
+        AppKind.Antigravity => "antigravity",
+        AppKind.Codex => "codex",
+        _ => "cursor",
+    };
 
-    public static string Label(AppKind kind) =>
-        kind == AppKind.Antigravity ? "Antigravity" : "Cursor";
+    public static string Label(AppKind kind) => kind switch
+    {
+        AppKind.Antigravity => "Antigravity",
+        AppKind.Codex => "Codex",
+        _ => "Cursor",
+    };
 
-    public static string ProcessName(AppKind kind) =>
-        kind == AppKind.Antigravity ? "Antigravity.exe" : "Cursor.exe";
+    public static string ProcessName(AppKind kind) => kind switch
+    {
+        AppKind.Antigravity => "Antigravity.exe",
+        AppKind.Codex => "ChatGPT.exe",
+        _ => "Cursor.exe",
+    };
 
-    public static string DefaultDataDir(AppKind kind) =>
-        Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            kind == AppKind.Antigravity ? "Antigravity" : "Cursor");
+    public static string DefaultDataDir(AppKind kind) => kind switch
+    {
+        AppKind.Antigravity => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Antigravity"),
+        AppKind.Codex => CodexLocator.DefaultCodexHome,
+        _ => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Cursor"),
+    };
 
-    public static string ProfilesDir(AppKind kind) =>
-        kind == AppKind.Antigravity
-            ? Path.Combine(AppPrefs.RootDir, "antigravity")
-            : AppPrefs.DefaultProfilesDir;
+    public static string ProfilesDir(AppKind kind) => kind switch
+    {
+        AppKind.Antigravity => Path.Combine(AppPrefs.RootDir, "antigravity"),
+        AppKind.Codex => Path.Combine(AppPrefs.RootDir, "codex"),
+        _ => AppPrefs.DefaultProfilesDir,
+    };
 
     /// <summary>
     /// 副账号沙箱根目录（userdata 与 home 的共同父目录）。只承认切换器自己目录下的路径。

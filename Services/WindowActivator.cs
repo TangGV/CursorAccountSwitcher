@@ -50,7 +50,7 @@ public static class WindowActivator
                 continue;
             }
 
-            return Activate(process.MainWindowHandle);
+            return ActivateWindow(process.MainWindowHandle);
         }
 
         return false;
@@ -59,7 +59,7 @@ public static class WindowActivator
     /// <summary>
     /// 激活窗口。Windows 对前台窗口有抢占限制，先 AttachThreadInput 提升成功率。
     /// </summary>
-    private static bool Activate(IntPtr hWnd)
+    public static bool ActivateWindow(IntPtr hWnd)
     {
         if (IsIconic(hWnd))
         {

@@ -8,6 +8,7 @@ public enum AppKind
 {
     Cursor,
     Antigravity,
+    Codex,
 }
 
 /// <summary>读写账号档案里的应用字段。缺字段、数字、无法识别的字符串都落回 Cursor，避免整份档案读失败。</summary>
@@ -17,14 +18,21 @@ public sealed class AppKindJsonConverter : JsonConverter<AppKind>
     {
         if (reader.TokenType == JsonTokenType.String)
         {
-            return string.Equals(reader.GetString(), "antigravity", StringComparison.OrdinalIgnoreCase)
-                ? AppKind.Antigravity
+            var text = reader.GetString();
+            if (string.Equals(text, "antigravity", StringComparison.OrdinalIgnoreCase))
+            {
+                return AppKind.Antigravity;
+            }
+
+            return string.Equals(text, "codex", StringComparison.OrdinalIgnoreCase)
+                ? AppKind.Codex
                 : AppKind.Cursor;
         }
 
-        if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out var n))
+        if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out var n)
+            && Enum.IsDefined(typeof(AppKind), n))
         {
-            return n == (int)AppKind.Antigravity ? AppKind.Antigravity : AppKind.Cursor;
+            return (AppKind)n;
         }
 
         return AppKind.Cursor;
@@ -32,6 +40,11 @@ public sealed class AppKindJsonConverter : JsonConverter<AppKind>
 
     public override void Write(Utf8JsonWriter writer, AppKind value, JsonSerializerOptions options)
     {
-        writer.WriteStringValue(value == AppKind.Antigravity ? "antigravity" : "cursor");
+        writer.WriteStringValue(value switch
+        {
+            AppKind.Antigravity => "antigravity",
+            AppKind.Codex => "codex",
+            _ => "cursor",
+        });
     }
 }
