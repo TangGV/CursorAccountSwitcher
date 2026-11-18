@@ -34,23 +34,26 @@ public static class WindowActivator
     private const int SwRestore = 9;
 
     /// <summary>
-    /// 找到属于指定数据目录的 Cursor 窗口并激活。找不到合适窗口时返回 false。
+    /// 找到属于指定数据目录的窗口并显示出来、切到前台。找不到窗口时返回 false。
+    /// 句柄来自 EnumWindows，所以隐藏到托盘（Process.MainWindowHandle 为 0）的窗口也能恢复。
     /// </summary>
     public static bool TryActivate(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
     {
+        var windows = NativeWindows.Snapshot();
+
         foreach (var process in CursorProcesses.Enumerate(processName))
         {
-            if (!process.IsInstance || process.MainWindowHandle == IntPtr.Zero)
+            if (!process.IsInstance
+                || !CursorProcesses.BelongsTo(process, userDataDir, defaultDataDir)
+                || !windows.TryGetValue(process.Pid, out var window))
             {
                 continue;
             }
 
-            if (!CursorProcesses.BelongsTo(process, userDataDir, defaultDataDir))
+            if (NativeWindows.TryShowAndActivate(window.Handle))
             {
-                continue;
+                return true;
             }
-
-            return ActivateWindow(process.MainWindowHandle);
         }
 
         return false;

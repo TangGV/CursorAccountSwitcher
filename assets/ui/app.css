@@ -176,6 +176,12 @@ html, body {
 }
 .btn.icon:hover { color: var(--text); }
 
+.btn.danger { color: #ec8a8a; border-color: rgba(241, 106, 106, 0.35); }
+.btn.danger:hover { background: rgba(241, 106, 106, 0.14); border-color: rgba(241, 106, 106, 0.55); }
+
+/* 卡片右侧三个操作按钮挤一点，保证长名字的账号也放得下 */
+.card .actions .btn.mini:not(.icon) { padding: 0 11px; }
+
 .link {
   background: none;
   border: 0;
@@ -316,6 +322,11 @@ html, body {
   background: var(--green);
   box-shadow: 0 0 0 3px rgba(61, 213, 140, 0.16);
 }
+/* 进程还在、窗口已经关掉：用黄色区分「后台运行」和「正在用」 */
+.card.running.background .dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(224, 163, 60, 0.16);
+}
 .card.running.unlogged .dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(224, 163, 60, 0.16); }
 
 .actions {
@@ -329,6 +340,9 @@ html, body {
   min-width: 84px;
   justify-content: center;
 }
+
+/* 运行中时三个按钮并排，卡片右侧宽度固定，避免状态切换时卡片抖动 */
+.card .actions { min-width: 0; }
 
 /* ---------------------------------------------------------------- 空状态 */
 .empty {

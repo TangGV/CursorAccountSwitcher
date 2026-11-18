@@ -100,12 +100,15 @@ public static class InstanceService
     /// <summary>
     /// 关闭指定数据目录对应的 Cursor 实例。只关主进程，子进程会随之退出。
     /// 返回关闭的实例数。
+    ///
+    /// 优先发 WM_CLOSE 让应用自己保存并退出；窗口藏在托盘里（或者对 WM_CLOSE 只隐藏不退出）
+    /// 时再强杀整个进程树，避免留下占着数据目录的残留进程。
     /// </summary>
     public static int CloseProcesses(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
     {
         var tracked = CursorProcesses.Enumerate(processName).ToList();
         var mine = tracked
-            .Where(p => CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir))
+            .Where(p => p.IsInstance && CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir))
             .ToList();
         var myPids = mine.Select(p => p.Pid).ToHashSet();
 
@@ -117,41 +120,26 @@ public static class InstanceService
                 .ToList()
             : new List<int>();
 
+        var windows = NativeWindows.Snapshot();
         var killed = 0;
-        foreach (var process in mine.Where(p => p.IsInstance))
+        foreach (var pid in myPids)
         {
-            try
-            {
-                using var proc = Process.GetProcessById(process.Pid);
-                if (proc.CloseMainWindow() && proc.WaitForExit(5000))
-                {
-                    killed++;
-                    continue;
-                }
+            var window = windows.TryGetValue(pid, out var info) ? info : default;
 
-                proc.Kill(entireProcessTree: true);
-                killed++;
-            }
-            catch
+            // 窗口已经藏起来了：WM_CLOSE 只会让它再隐藏一次，直接结束进程。
+            if (window.Visible && NativeWindows.TryCloseGracefully(pid, window.Handle, 5000))
             {
+                killed++;
+                continue;
             }
+
+            NativeWindows.KillTree(pid);
+            killed++;
         }
 
         foreach (var pid in serverPids)
         {
-            try
-            {
-                using var proc = Process.GetProcessById(pid);
-                if (proc.HasExited)
-                {
-                    continue;
-                }
-
-                proc.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-            }
+            NativeWindows.KillTree(pid);
         }
 
         return killed;

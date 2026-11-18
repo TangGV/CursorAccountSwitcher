@@ -16,6 +16,7 @@ Cursor 默认只记一个登录态。想同时用「公司号」和「个人号�
 |---|---|
 | 多实例并行 | 每个账号一个独立数据目录，可同时运行 |
 | 状态识别 | 从 `state.vscdb` 读邮箱与订阅类型，实时显示运行状态 |
+| 打开 / 重启 / 关闭 | 账号在跑时卡片上直接给出三个按钮：打开窗口、重启实例、关闭进程 |
 | Agent 面板启动 | 默认 `--glass`，启动即进入对话界面；可切换成编辑器窗口 |
 | 设置同步 | 把主账号的 `settings.json` / 快捷键 / 片段复制到其他账号，哈希保护防止覆盖你自己的改动 |
 | 会话同步 | 白名单同步最近项目、终端历史等 UI 状态，**绝不触碰 `cursorAuth/*` 凭证** |
@@ -46,7 +47,9 @@ dotnet publish -c Release -r win-x64 --self-contained false -o dist
 1. 打开后会自动列出主账号（Cursor 默认数据目录）
 2. 点「添加账号」→ 起个名字 → 立即启动
 3. 在新窗口里点右上角头像 → Sign In 登录第二个账号
-4. 之后两个账号可以同时开着，用「切换过去」在窗口间跳
+4. 之后两个账号可以同时开着，卡片上的「打开」把窗口提到前台，「重启」关掉再重新启动，「关闭」结束这个账号的进程
+
+> 关闭窗口不等于退出：Electron 应用（Cursor / Antigravity / Codex）点窗口右上角的关闭通常只是隐藏到托盘，进程会继续活着。所以卡片会显示「已在后台 · 窗口已关闭」，这时用「打开」可以把窗口重新显示出来，用「关闭」才会真正结束进程。
 
 数据目录在 `%APPDATA%\CursorAccountSwitcher\profiles\<id>`，每个账号独立。移除账号时可以选择是否连数据一起删。
 
@@ -82,6 +85,8 @@ Services/
   AntigravityLocator.cs     定位 Antigravity 2.x（Antigravity.exe）
   CodexLocator.cs           定位 Codex 桌面版（商店版 ChatGPT.exe）
   CursorProcesses.cs        枚举进程、解析 --user-data-dir、判断归属
+  NativeWindows.cs          枚举顶层窗口（隐藏到托盘的也能找到）、显示窗口、WM_CLOSE
+  RuntimeSnapshot.cs        一次查完进程表与窗口表，供所有账号复用
   InstanceService.cs        启动 / 关闭实例
   WindowActivator.cs        Win32 窗口激活
   StateDbReader.cs          只读 state.vscdb 取 Cursor 登录信息
@@ -110,6 +115,10 @@ Codex 桌面版由 Microsoft Store 分发，会忽略 `--user-data-dir`，窗口
 通过 `CODEX_HOME` 隔离登录、会话与配置，主账号继续用 `~\.codex`。由于它的命令行里不带
 数据目录，切换器在启动时记下新出现的进程，用来判断某个副账号是否还在运行；从开始菜单
 另开的窗口会被当成主账号。
+
+关掉 Codex 的窗口时进程往往还在后台（托盘图标仍在），卡片会显示「已在后台 · 窗口已关闭」。
+这时「打开」能把窗口重新叫出来，「关闭」会先发 WM_CLOSE、几秒内没退出就结束整棵进程树，
+所以不会再出现「已经退出了却还显示切换过去」。
 
 ## License
 

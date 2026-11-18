@@ -29,14 +29,21 @@ window.__updateList = function (json) {
   try { incoming = JSON.parse(json); } catch { return; }
   if (!Array.isArray(incoming) || incoming.length === 0) return;
 
-  // 账号集合变了（增/删）就整体重绘，否则只改状态。
+  // 账号集合变了（增/删）就整体重绘。
   const sameShape =
     incoming.length === accounts.length &&
     incoming.every((a, i) => accounts[i] && accounts[i].id === a.id);
 
+  // 运行 / 后台状态变了，卡片上的按钮组也要跟着变，同样整体重绘。
+  const sameFlags =
+    sameShape &&
+    incoming.every((a, i) =>
+      !!a.isRunning === !!accounts[i].isRunning &&
+      !!a.isHidden === !!accounts[i].isHidden);
+
   accounts = incoming;
 
-  if (!sameShape || document.querySelectorAll('#list .card').length !== accounts.length) {
+  if (!sameShape || !sameFlags || document.querySelectorAll('#list .card').length !== accounts.length) {
     render();
     return;
   }
@@ -46,6 +53,7 @@ window.__updateList = function (json) {
     if (!card) { render(); return; }
 
     card.classList.toggle('running', !!a.isRunning);
+    card.classList.toggle('background', !!a.isHidden);
     card.classList.toggle('unlogged', !!a.isRunning && !a.hasLogin);
 
     const statusEl = card.querySelector('.status span:last-child');
@@ -55,12 +63,6 @@ window.__updateList = function (json) {
     if (emailEl && emailEl.textContent !== a.displayEmail) {
       emailEl.textContent = a.displayEmail;
       emailEl.title = a.displayEmail;
-    }
-
-    const launchBtn = card.querySelector('[data-act="launch"]');
-    if (launchBtn) {
-      const want = a.isRunning ? '切换过去' : '启动';
-      if (launchBtn.textContent.trim() !== want) launchBtn.textContent = want;
     }
   }
 
@@ -161,12 +163,22 @@ function cardHtml(a) {
   const [bg, fg] = colorFor(a.name);
   const cls = ['card'];
   if (a.isRunning) cls.push('running');
+  if (a.isHidden) cls.push('background');
   if (a.isRunning && !a.hasLogin) cls.push('unlogged');
 
   const planTag = a.membershipText
     ? `<span class="tag plan">${escapeHtml(a.membershipText)}</span>`
     : '';
   const defTag = a.isMain ? '<span class="tag default">默认</span>' : '';
+
+  // 运行中（含窗口已被关到后台）给「打开 / 重启 / 关闭」，未运行时只留「启动」。
+  const buttons = a.isRunning
+    ? `
+        <button class="btn mini ghost" data-act="open" data-id="${escapeHtml(a.id)}" title="把窗口显示出来并切到前台">打开</button>
+        <button class="btn mini ghost" data-act="restart" data-id="${escapeHtml(a.id)}" title="关掉这个实例再重新启动">重启</button>
+        <button class="btn mini ghost danger" data-act="close" data-id="${escapeHtml(a.id)}" title="结束这个账号的进程">关闭</button>`
+    : `
+        <button class="btn mini primary btn-launch" data-act="launch" data-id="${escapeHtml(a.id)}">启动</button>`;
 
   return `
     <div class="${cls.join(' ')}" data-id="${escapeHtml(a.id)}">
@@ -183,9 +195,7 @@ function cardHtml(a) {
         <div class="status"><span class="dot"></span><span>${escapeHtml(a.statusText)}</span></div>
       </div>
       <div class="actions">
-        <button class="btn mini primary btn-launch" data-act="launch" data-id="${escapeHtml(a.id)}">
-          ${a.isRunning ? '切换过去' : '启动'}
-        </button>
+        ${buttons}
         <button class="btn mini ghost icon" data-act="more" data-id="${escapeHtml(a.id)}" title="更多操作">⋯</button>
       </div>
     </div>`;
@@ -356,9 +366,14 @@ document.addEventListener('click', async (e) => {
       }
       break;
 
-    case 'activate':
+    case 'open':
       closeMenu();
-      await run('activate', () => host('activate', { id }), '已切换到该窗口');
+      await doOpen(account);
+      break;
+
+    case 'restart':
+      closeMenu();
+      await doRestart(account);
       break;
 
     case 'close':
@@ -491,15 +506,43 @@ async function doClose(account) {
   if (!account) return;
   const r = await showModal({
     title: `关闭「${account.name}」的实例？`,
-    desc: '未保存的编辑器内容会提示你保存，不会强制丢弃。',
+    desc: '会先请求它自己退出，没保存的内容有机会保存；如果几秒内没退出，就直接结束进程。',
     choices: [{ label: '关闭实例' }, { label: '取消' }],
     okText: '继续',
   });
   if (!r || r.choice !== 0) return;
   try {
-    await host('close', { id: account.id });
-    toast(`正在关闭「${account.name}」…`);
-    setTimeout(() => refresh(false).catch(() => {}), 1800);
+    const res = await host('close', { id: account.id });
+    toast((res && res.message) || `已关闭「${account.name}」`);
+    await refresh(false);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function doOpen(account) {
+  if (!account) return;
+  try {
+    const res = await host('open', { id: account.id });
+    if (res && res.message) toast(res.message);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function doRestart(account) {
+  if (!account) return;
+  const r = await showModal({
+    title: `重启「${account.name}」的实例？`,
+    desc: '先关掉现在这个进程，再按当前设置重新启动。没保存的内容会先尝试保存。',
+    choices: [{ label: '重启' }, { label: '取消' }],
+    okText: '继续',
+  });
+  if (!r || r.choice !== 0) return;
+  try {
+    toast(`正在重启「${account.name}」…`);
+    await host('restart', { id: account.id });
+    await refresh(false);
   } catch (err) {
     toast(String(err.message || err), true);
   }

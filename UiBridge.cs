@@ -27,6 +27,8 @@ public sealed class UiBridge
     private readonly ProfileStore _store;
     private readonly AppPrefs _prefs;
     private readonly DispatcherTimer _statusTimer;
+    // 查进程表要走 WMI，几百毫秒到几秒不等，不能挂在界面线程上。
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
 
     public UiBridge(Window window, CoreWebView2 core)
     {
@@ -115,12 +117,13 @@ public sealed class UiBridge
         "setSettings" => SetSettings(arg),
         "listAccounts" => await ListAccountsAsync(arg),
         "launch" => await LaunchAsync(ArgString(arg, "id")),
-        "activate" => Activate(ArgString(arg, "id")),
+        "open" => await OpenWindowAsync(ArgString(arg, "id")),
+        "restart" => await RestartAsync(ArgString(arg, "id")),
         "close" => await CloseAsync(ArgString(arg, "id")),
         "openProject" => await OpenProjectAsync(ArgString(arg, "id")),
         "add" => AddAccount(arg),
         "rename" => RenameAccount(arg),
-        "remove" => RemoveAccount(arg),
+        "remove" => await RemoveAccountAsync(arg),
         "openDir" => OpenDir(ArgString(arg, "id")),
         "copyDir" => CopyDir(ArgString(arg, "id")),
         "openPrefs" => OpenPrefs(),
@@ -203,17 +206,35 @@ public sealed class UiBridge
 
     // ------------------------------------------------------------------ 账号
 
-    private Task<object?> ListAccountsAsync(JsonElement arg)
+    private async Task<object?> ListAccountsAsync(JsonElement arg)
     {
         var deep = arg.ValueKind == JsonValueKind.Object
                    && arg.TryGetProperty("deep", out var d)
                    && d.ValueKind == JsonValueKind.True;
 
-        return Task.FromResult<object?>(ListDtos(deep));
+        // 查进程/读数据库都在后台线程做，避免界面卡住。
+        // 档案列表先在界面线程拷一份，后台线程只读这份副本。
+        var profiles = _store.Profiles.ToList();
+
+        await _refreshGate.WaitAsync();
+        try
+        {
+            return await Task.Run(() => (object?)ListDtos(profiles, deep));
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
     }
 
-    private List<object> ListDtos(bool deep) =>
-        _store.Profiles
+    private List<object> ListDtos(bool deep) => ListDtos(_store.Profiles.ToList(), deep);
+
+    private List<object> ListDtos(IReadOnlyList<AccountProfile> profiles, bool deep)
+    {
+        // 进程表和窗口表各查一次，账号数量不影响耗时。
+        var snapshot = new RuntimeSnapshot();
+
+        return profiles
             .Select((profile, index) => (profile, index))
             .OrderBy(x => x.profile.App switch
             {
@@ -223,15 +244,32 @@ public sealed class UiBridge
             })
             .ThenBy(x => x.profile.IsMain ? 0 : 1)
             .ThenBy(x => x.index)
-            .Select(x => ToDto(x.profile, deep))
+            .Select(x => ToDto(x.profile, snapshot, deep))
             .ToList();
+    }
 
     /// <summary>定时把状态推给前端（保持卡片上的运行状态实时）。</summary>
     private async Task PushAsync()
     {
         try
         {
-            var items = ListDtos(deep: false);
+            if (!await _refreshGate.WaitAsync(0))
+            {
+                // 上一次刷新还没完成，这一拍跳过。
+                return;
+            }
+
+            List<object> items;
+            var profiles = _store.Profiles.ToList();
+            try
+            {
+                items = await Task.Run(() => ListDtos(profiles, deep: false));
+            }
+            finally
+            {
+                _refreshGate.Release();
+            }
+
             var json = JsonSerializer.Serialize(items, Json);
             var script = $"window.__updateList && window.__updateList({JsonSerializer.Serialize(json)});";
             await _core.ExecuteScriptAsync(script);
@@ -242,9 +280,12 @@ public sealed class UiBridge
         }
     }
 
-    private object ToDto(AccountProfile p, bool deep)
+    private object ToDto(AccountProfile p, RuntimeSnapshot snapshot, bool deep)
     {
-        var isRunning = IsProfileRunning(p);
+        var pids = snapshot.PidsOf(p);
+        var isRunning = pids.Count > 0;
+        // 进程在但窗口不可见：用户关掉的是窗口，应用还挂在托盘里。
+        var isHidden = isRunning && !snapshot.HasVisibleWindow(pids);
 
         if (deep)
         {
@@ -275,14 +316,28 @@ public sealed class UiBridge
             dataDir = p.DataDir,
             isMain = p.IsMain,
             isRunning,
+            isHidden,
             hasLogin = p.HasLogin,
             displayEmail = p.DisplayEmail,
             membershipText = p.MembershipText,
-            statusText = isRunning
-                ? (p.HasLogin ? "运行中" : "运行中 · 未登录")
-                : (p.HasLogin ? "已登录 · 未启动" : "未登录"),
+            statusText = StatusText(p, isRunning, isHidden),
             dataDirExists = SafeExists(p.DataDir),
         };
+    }
+
+    private static string StatusText(AccountProfile p, bool isRunning, bool isHidden)
+    {
+        if (isHidden)
+        {
+            return p.HasLogin ? "已在后台 · 窗口已关闭" : "后台运行 · 未登录";
+        }
+
+        if (isRunning)
+        {
+            return p.HasLogin ? "运行中" : "运行中 · 未登录";
+        }
+
+        return p.HasLogin ? "已登录 · 未启动" : "未登录";
     }
 
     private static bool SafeExists(string path)
@@ -314,10 +369,44 @@ public sealed class UiBridge
             return await LaunchCodexAsync(profile, exe);
         }
 
-        if (InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) > 0)
+        var runningMessage = await TryShowRunningAsync(profile);
+        if (runningMessage is not null)
         {
-            WindowActivator.TryActivate(profile.DataDir, DefaultDir(profile), ProcessName(profile));
-            return new { message = $"「{profile.Name}」已经在运行，已切换到它的窗口。" };
+            return new { message = runningMessage };
+        }
+
+        return await StartInstanceAsync(profile, exe);
+    }
+
+    /// <summary>
+    /// 已经在跑就不再开新窗口，而是把现有窗口显示出来并切到前台。
+    /// 用户点窗口的关闭按钮只是把窗口藏起来（进程还在托盘），这时也能恢复。
+    /// 返回 null 表示没在运行，可以真正启动。
+    /// </summary>
+    private static async Task<string?> TryShowRunningAsync(AccountProfile profile) =>
+        await Task.Run(() =>
+        {
+            var snapshot = new RuntimeSnapshot();
+            var pids = snapshot.PidsOf(profile);
+            if (pids.Count == 0)
+            {
+                return null;
+            }
+
+            if (snapshot.TryShowAny(pids))
+            {
+                return $"「{profile.Name}」已经在运行，已切换到它的窗口。";
+            }
+
+            return $"「{profile.Name}」的进程还在后台运行，但没找到窗口。可以先关掉它再重新启动。";
+        }).ConfigureAwait(true);
+
+    /// <summary>真正启动一个新实例。调用方已经确认它没在运行。</summary>
+    private async Task<object?> StartInstanceAsync(AccountProfile profile, string exe)
+    {
+        if (profile.App == AppKind.Codex)
+        {
+            return await LaunchCodexAsync(profile, exe);
         }
 
         PrepareDataDir(profile);
@@ -346,27 +435,30 @@ public sealed class UiBridge
     /// </summary>
     private async Task<object?> LaunchCodexAsync(AccountProfile profile, string exe)
     {
-        if (profile.IsMain)
+        // 查进程表要走 WMI，放到后台线程，别卡住界面。
+        var existing = await Task.Run<IReadOnlyList<int>>(() => profile.IsMain
+            ? CodexInstanceTracker.UntrackedMainPids()
+            : CodexInstanceTracker.PidsFor(profile.Id)).ConfigureAwait(true);
+
+        if (existing.Count > 0)
         {
-            var existing = CodexInstanceTracker.UntrackedMainPids();
-            if (existing.Count > 0)
+            // 进程还在（窗口可能已被关到托盘），只做恢复显示，不开新窗口。
+            var shown = await Task.Run(() => CodexInstanceTracker.TryActivate(existing)).ConfigureAwait(true);
+
+            return new
             {
-                CodexInstanceTracker.TryActivate(existing);
-                return new { message = $"「{profile.Name}」已经在运行，已切换到它的窗口。" };
-            }
-        }
-        else if (CodexInstanceTracker.PidsFor(profile.Id) is { Count: > 0 } mine)
-        {
-            CodexInstanceTracker.TryActivate(mine);
-            return new { message = $"「{profile.Name}」已经在运行，已切换到它的窗口。" };
+                message = shown
+                    ? $"「{profile.Name}」已经在运行，已切换到它的窗口。"
+                    : $"「{profile.Name}」的进程还在后台运行，但没找到窗口。可以先关掉它再重新启动。",
+            };
         }
 
         PrepareDataDir(profile);
 
-        var before = CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
+        var before = await Task.Run(() => CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
             .Where(p => p.IsInstance)
             .Select(p => p.Pid)
-            .ToHashSet();
+            .ToHashSet()).ConfigureAwait(true);
 
         try
         {
@@ -405,10 +497,10 @@ public sealed class UiBridge
         {
             await Task.Delay(400);
 
-            var started = CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
+            var started = await Task.Run(() => CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
                 .Where(p => p.IsInstance && !before.Contains(p.Pid))
                 .Select(p => p.Pid)
-                .FirstOrDefault();
+                .FirstOrDefault()).ConfigureAwait(true);
 
             if (started > 0)
             {
@@ -425,15 +517,6 @@ public sealed class UiBridge
         {
             ["CODEX_HOME"] = Path.GetFullPath(profile.DataDir),
         };
-
-    /// <summary>Codex 的主进程没有数据目录参数，运行状态要按记录判断。</summary>
-    private bool IsProfileRunning(AccountProfile profile) => profile.App switch
-    {
-        AppKind.Codex => profile.IsMain
-            ? CodexInstanceTracker.UntrackedMainPids().Count > 0
-            : CodexInstanceTracker.IsRunning(profile.Id),
-        _ => InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) > 0,
-    };
 
     /// <summary>启动前准备：确保目录存在，按偏好同步设置与会话。</summary>
     private void PrepareDataDir(AccountProfile profile)
@@ -481,92 +564,129 @@ public sealed class UiBridge
         }
     }
 
-    private object Activate(string id)
+    /// <summary>
+    /// 「打开」：只把已有窗口显示出来并切到前台，不启动新进程。
+    /// 进程不在运行时给出提示，由用户决定用「重启」拉起来。
+    /// </summary>
+    private async Task<object?> OpenWindowAsync(string id)
     {
         var profile = FindProfile(id);
 
-        if (profile.App == AppKind.Codex)
+        // 枚举进程和窗口都要走系统 API，放到后台线程，别卡住界面。
+        var result = await Task.Run(() =>
         {
-            var pids = profile.IsMain
-                ? CodexInstanceTracker.UntrackedMainPids()
-                : CodexInstanceTracker.PidsFor(profile.Id);
+            var snapshot = new RuntimeSnapshot();
+            var pids = snapshot.PidsOf(profile);
 
             if (pids.Count == 0)
             {
-                throw new InvalidOperationException($"「{profile.Name}」没有在运行。");
+                return $"「{profile.Name}」没有在运行，用「重启」或「启动」把它拉起来。";
             }
 
-            if (!CodexInstanceTracker.TryActivate(pids))
+            if (!snapshot.TryShowAny(pids))
             {
-                throw new InvalidOperationException($"没找到「{profile.Name}」的窗口，请从任务栏切换过去。");
+                return $"没找到「{profile.Name}」的窗口，它可能在后台运行。用「重启」重新打开。";
             }
 
-            return new { ok = true };
-        }
+            return "";
+        });
 
-        if (InstanceService.CountProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile)) == 0)
+        if (result.Length > 0)
         {
-            throw new InvalidOperationException($"「{profile.Name}」没有在运行。");
+            throw new InvalidOperationException(result);
         }
 
-        if (!WindowActivator.TryActivate(profile.DataDir, DefaultDir(profile), ProcessName(profile)))
-        {
-            throw new InvalidOperationException($"没找到「{profile.Name}」的窗口，请从任务栏切换过去。");
-        }
-
-        return new { ok = true };
+        return new { message = $"已切到「{profile.Name}」的窗口" };
     }
 
-    private Task<object?> CloseAsync(string id)
+    /// <summary>「重启」：先关掉现有实例，再按当前偏好重新启动。</summary>
+    private async Task<object?> RestartAsync(string id)
+    {
+        var profile = FindProfile(id);
+        var exe = RequireExe(profile.App);
+
+        if (await CloseInstanceAsync(profile))
+        {
+            // 等进程真正退干净，否则新进程会把请求转给旧实例然后就退出。
+            await WaitUntilStoppedAsync(profile);
+        }
+
+        return await StartInstanceAsync(profile, exe);
+    }
+
+    /// <summary>等进程真正消失（关闭/重启后进程收尾需要一点时间）。</summary>
+    private static async Task WaitUntilStoppedAsync(AccountProfile profile)
+    {
+        for (var i = 0; i < 15; i++)
+        {
+            var stillRunning = await Task.Run(() => new RuntimeSnapshot().IsRunning(profile))
+                .ConfigureAwait(true);
+
+            if (!stillRunning)
+            {
+                return;
+            }
+
+            await Task.Delay(400);
+        }
+    }
+
+    private async Task<object?> CloseAsync(string id)
     {
         var profile = FindProfile(id);
 
-        if (profile.App == AppKind.Codex)
-        {
-            var pids = profile.IsMain
-                ? CodexInstanceTracker.UntrackedMainPids()
-                : CodexInstanceTracker.PidsFor(profile.Id);
-
-            if (pids.Count == 0)
-            {
-                throw new InvalidOperationException($"没有找到「{profile.Name}」的运行实例。");
-            }
-
-            var closed = 0;
-            foreach (var pid in pids)
-            {
-                try
-                {
-                    using var proc = Process.GetProcessById(pid);
-                    if (proc.CloseMainWindow() && proc.WaitForExit(6000))
-                    {
-                        closed++;
-                        continue;
-                    }
-
-                    proc.Kill(entireProcessTree: true);
-                    closed++;
-                }
-                catch
-                {
-                }
-            }
-
-            if (!profile.IsMain)
-            {
-                CodexInstanceTracker.Forget(profile.Id);
-            }
-
-            return Task.FromResult<object?>(new { message = $"正在关闭「{profile.Name}」…" });
-        }
-
-        var count = InstanceService.CloseProcesses(profile.DataDir, DefaultDir(profile), ProcessName(profile));
-        if (count == 0)
+        if (!await CloseInstanceAsync(profile))
         {
             throw new InvalidOperationException($"没有找到「{profile.Name}」的运行实例。");
         }
-        return Task.FromResult<object?>(new { message = $"正在关闭「{profile.Name}」…" });
+
+        // 从点关闭到进程真正消失有一段收尾时间，等它落定再回前端，
+        // 否则卡片要等定时刷新才变，看起来像「已经关了还显示运行中」。
+        await WaitUntilStoppedAsync(profile);
+        return new { message = $"已关闭「{profile.Name}」" };
     }
+
+    /// <summary>
+    /// 结束某个账号的实例。只发 WM_CLOSE 不够：Electron 应用关窗口多半只是隐藏到托盘，
+    /// 进程会一直挂着，卡片就永远显示「运行中」。所以先礼后刀，进程没退就强杀整棵进程树。
+    /// 返回是否真的找到了实例。
+    /// </summary>
+    private async Task<bool> CloseInstanceAsync(AccountProfile profile) =>
+        await Task.Run(() =>
+        {
+            var snapshot = new RuntimeSnapshot();
+            var pids = snapshot.PidsOf(profile);
+            if (pids.Count == 0)
+            {
+                return false;
+            }
+
+            if (profile.App == AppKind.Codex)
+            {
+                foreach (var pid in pids)
+                {
+                    var window = snapshot.TryGetWindow(pid, out var info) ? info : default;
+
+                    // 窗口已经藏起来了：WM_CLOSE 只会让它再隐藏一次，直接结束进程。
+                    if (window.Visible && NativeWindows.TryCloseGracefully(pid, window.Handle, 4000))
+                    {
+                        continue;
+                    }
+
+                    NativeWindows.KillTree(pid);
+                }
+
+                if (!profile.IsMain)
+                {
+                    CodexInstanceTracker.Forget(profile.Id);
+                }
+
+                return true;
+            }
+
+            InstanceService.CloseProcesses(profile.DataDir, DefaultDir(profile), AppCatalog.ProcessName(profile.App));
+            return true;
+        }).ConfigureAwait(true);
 
     private Task<object?> OpenProjectAsync(string id)
     {
@@ -638,7 +758,7 @@ public sealed class UiBridge
         return new { ok = true };
     }
 
-    private object RemoveAccount(JsonElement arg)
+    private async Task<object?> RemoveAccountAsync(JsonElement arg)
     {
         var profile = FindProfile(ArgString(arg, "id"));
 
@@ -647,7 +767,7 @@ public sealed class UiBridge
             throw new InvalidOperationException("主账号不能移除。");
         }
 
-        if (IsProfileRunning(profile))
+        if (await Task.Run(() => new RuntimeSnapshot().IsRunning(profile)))
         {
             throw new InvalidOperationException("这个账号正在运行，请先关闭它再移除。");
         }
@@ -709,8 +829,6 @@ public sealed class UiBridge
     }
 
     // ------------------------------------------------------------------ 安装定位
-
-    private static string ProcessName(AccountProfile profile) => AppCatalog.ProcessName(profile.App);
 
     private static string DefaultDir(AccountProfile profile) => AppCatalog.DefaultDataDir(profile.App);
 

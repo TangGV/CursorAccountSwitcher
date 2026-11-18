@@ -113,7 +113,7 @@ public static class CodexInstanceTracker
             .ToList();
     }
 
-    /// <summary>按 PID 找到窗口并切到前台。</summary>
+    /// <summary>按 PID 找到窗口并切到前台（窗口藏在托盘里也会先显示出来）。</summary>
     public static bool TryActivate(IReadOnlyList<int> pids)
     {
         if (pids.Count == 0)
@@ -121,14 +121,14 @@ public static class CodexInstanceTracker
             return false;
         }
 
-        foreach (var process in CursorProcesses.Enumerate(ProcessName))
-        {
-            if (!process.IsInstance || !pids.Contains(process.Pid) || process.MainWindowHandle == IntPtr.Zero)
-            {
-                continue;
-            }
+        var windows = NativeWindows.Snapshot();
 
-            return WindowActivator.ActivateWindow(process.MainWindowHandle);
+        foreach (var pid in pids)
+        {
+            if (windows.TryGetValue(pid, out var window) && NativeWindows.TryShowAndActivate(window.Handle))
+            {
+                return true;
+            }
         }
 
         return false;
