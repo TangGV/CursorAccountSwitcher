@@ -15,14 +15,37 @@ public static class CursorProcesses
 {
     public sealed record CursorProcess(int Pid, int ParentPid, IntPtr MainWindowHandle, string? UserDataDir, bool IsInstance);
 
-    public static IEnumerable<CursorProcess> Enumerate(string processName = "Cursor.exe")
+    public static IEnumerable<CursorProcess> Enumerate(string processName = "Cursor.exe") =>
+        EnumerateMany(new[] { processName }).TryGetValue(processName, out var list)
+            ? list
+            : Array.Empty<CursorProcess>();
+
+    /// <summary>
+    /// 一次把多个进程名的信息全查回来，按进程名分组。
+    ///
+    /// WMI 每次查询都有约 600ms 的固定开销，逐个进程名查（Cursor / Antigravity / Codex …）
+    /// 会线性叠加；合成一条 OR 查询后总耗时基本恒定。
+    /// </summary>
+    public static Dictionary<string, List<CursorProcess>> EnumerateMany(IEnumerable<string> processNames)
     {
-        var result = new List<CursorProcess>();
+        var grouped = new Dictionary<string, List<CursorProcess>>(StringComparer.OrdinalIgnoreCase);
+        var names = processNames
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Select(n => n.Replace("'", ""))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (names.Count == 0)
+        {
+            return grouped;
+        }
+
+        var filter = string.Join(" OR ", names.Select(n => $"Name = '{n}'"));
+        var query = "SELECT ProcessId, ParentProcessId, Name, CommandLine FROM Win32_Process WHERE " + filter;
+
         try
         {
-            var safeName = processName.Replace("'", "");
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, ParentProcessId, CommandLine FROM Win32_Process WHERE Name = '" + safeName + "'");
+            using var searcher = new ManagementObjectSearcher(query);
 
             foreach (var obj in searcher.Get())
             {
@@ -30,8 +53,8 @@ public static class CursorProcesses
                 {
                     var pid = Convert.ToInt32(obj["ProcessId"] ?? 0);
                     var parent = Convert.ToInt32(obj["ParentProcessId"] ?? 0);
+                    var name = obj["Name"] as string ?? string.Empty;
                     var cmd = obj["CommandLine"] as string ?? string.Empty;
-                    var isInstance = IsInstanceCommandLine(cmd);
 
                     IntPtr handle = IntPtr.Zero;
                     try
@@ -43,7 +66,13 @@ public static class CursorProcesses
                     {
                     }
 
-                    result.Add(new CursorProcess(pid, parent, handle, ExtractUserDataDir(cmd), isInstance));
+                    if (!grouped.TryGetValue(name, out var list))
+                    {
+                        list = new List<CursorProcess>();
+                        grouped[name] = list;
+                    }
+
+                    list.Add(new CursorProcess(pid, parent, handle, ExtractUserDataDir(cmd), IsInstanceCommandLine(cmd)));
                 }
                 catch
                 {
@@ -58,7 +87,7 @@ public static class CursorProcesses
         {
         }
 
-        return result;
+        return grouped;
     }
 
     /// <summary>只有主进程才算一个实例。</summary>

@@ -1,10 +1,13 @@
-using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 
 namespace CursorAccountSwitcher.Services;
 
-/// <summary>把已经在运行的 Cursor 实例窗口切到前台。</summary>
+/// <summary>
+/// Win32 窗口前置。
+///
+/// 找窗口的逻辑在 <see cref="NativeWindows"/>：那里用 EnumWindows 枚举，
+/// 隐藏到托盘的窗口也能拿到句柄。这里只负责「已知句柄，把它弄到用户眼前」。
+/// </summary>
 public static class WindowActivator
 {
     [DllImport("user32.dll")]
@@ -31,39 +34,26 @@ public static class WindowActivator
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
 
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+
     private const int SwRestore = 9;
-
-    /// <summary>
-    /// 找到属于指定数据目录的窗口并显示出来、切到前台。找不到窗口时返回 false。
-    /// 句柄来自 EnumWindows，所以隐藏到托盘（Process.MainWindowHandle 为 0）的窗口也能恢复。
-    /// </summary>
-    public static bool TryActivate(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
-    {
-        var windows = NativeWindows.Snapshot();
-
-        foreach (var process in CursorProcesses.Enumerate(processName))
-        {
-            if (!process.IsInstance
-                || !CursorProcesses.BelongsTo(process, userDataDir, defaultDataDir)
-                || !windows.TryGetValue(process.Pid, out var window))
-            {
-                continue;
-            }
-
-            if (NativeWindows.TryShowAndActivate(window.Handle))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private static readonly IntPtr HwndNotTopmost = new(-2);
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoActivate = 0x0010;
 
     /// <summary>
     /// 激活窗口。Windows 对前台窗口有抢占限制，先 AttachThreadInput 提升成功率。
     /// </summary>
     public static bool ActivateWindow(IntPtr hWnd)
     {
+        if (hWnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
         if (IsIconic(hWnd))
         {
             ShowWindow(hWnd, SwRestore);
@@ -87,6 +77,15 @@ public static class WindowActivator
         try
         {
             BringWindowToTop(hWnd);
+            if (SetForegroundWindow(hWnd))
+            {
+                return true;
+            }
+
+            // 仍被前台锁定挡住：短暂置顶再取消。带 SWP_NOACTIVATE 只改变 Z 序，
+            // 所以置顶后还要再试一次 SetForegroundWindow 拿焦点。
+            SetWindowPos(hWnd, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+            SetWindowPos(hWnd, HwndNotTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
             return SetForegroundWindow(hWnd);
         }
         finally

@@ -109,4 +109,49 @@ public static class StateDbReader
             return false;
         }
     }
+
+    /// <summary>
+    /// 该数据目录的键值库里是否出现过这段文字。
+    ///
+    /// 用于反查通知归属：通知正文带会话标题，只有发出它的那个实例会把标题写进自己的库。
+    /// 全表 LIKE 在这种行数（几千行）下只要几十毫秒，可以实时调用。
+    /// </summary>
+    public static bool ContainsText(string userDataDir, string needle)
+    {
+        if (string.IsNullOrWhiteSpace(needle))
+        {
+            return false;
+        }
+
+        var dbPath = GetStateDbPath(userDataDir);
+        if (!File.Exists(dbPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath,
+                Mode = SqliteOpenMode.ReadOnly,
+                Cache = SqliteCacheMode.Shared,
+                Pooling = false,
+            };
+
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM ItemTable WHERE CAST(value AS TEXT) LIKE $t";
+            // LIKE 的通配符在搜索词里要清掉，否则标题里的 % 会把范围放大。
+            command.Parameters.AddWithValue("$t", "%" + needle.Replace("%", "").Replace("_", "") + "%");
+            var result = command.ExecuteScalar();
+            return Convert.ToInt64(result ?? 0L) > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 }

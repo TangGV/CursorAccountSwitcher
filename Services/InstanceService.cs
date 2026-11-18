@@ -3,7 +3,7 @@ using System.IO;
 
 namespace CursorAccountSwitcher.Services;
 
-/// <summary>判断某个数据目录对应的 Cursor 实例是否在运行，并负责启动与关闭。</summary>
+/// <summary>启动实例。关闭逻辑集中在 UiBridge，按「显示 → WM_CLOSE → 强杀」的顺序处理。</summary>
 public static class InstanceService
 {
     /// <summary>
@@ -18,14 +18,11 @@ public static class InstanceService
         Editor,
     }
 
-    /// <summary>统计使用指定数据目录的主进程数（0 或 1，异常情况下可能更多）。</summary>
-    public static int CountProcesses(string userDataDir, string defaultDataDir, string processName = "Cursor.exe") =>
-        CursorProcesses.Enumerate(processName)
-            .Count(p => p.IsInstance && CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir));
-
     /// <summary>
     /// 启动某个数据目录对应的实例。openPath 非空时用它打开指定文件夹。
     /// mode 为空时不加 Cursor 的窗口参数。environment 非空时直接启动并把这些变量传给进程。
+    ///
+    /// 副账号始终带 --user-data-dir：这是归属判断的依据，Codex 商店版同样认这个参数。
     /// </summary>
     public static void Launch(
         string exePath,
@@ -95,53 +92,5 @@ public static class InstanceService
         }
 
         Process.Start(startInfo);
-    }
-
-    /// <summary>
-    /// 关闭指定数据目录对应的 Cursor 实例。只关主进程，子进程会随之退出。
-    /// 返回关闭的实例数。
-    ///
-    /// 优先发 WM_CLOSE 让应用自己保存并退出；窗口藏在托盘里（或者对 WM_CLOSE 只隐藏不退出）
-    /// 时再强杀整个进程树，避免留下占着数据目录的残留进程。
-    /// </summary>
-    public static int CloseProcesses(string userDataDir, string defaultDataDir, string processName = "Cursor.exe")
-    {
-        var tracked = CursorProcesses.Enumerate(processName).ToList();
-        var mine = tracked
-            .Where(p => p.IsInstance && CursorProcesses.BelongsTo(p, userDataDir, defaultDataDir))
-            .ToList();
-        var myPids = mine.Select(p => p.Pid).ToHashSet();
-
-        // 语言服务是另一个进程名，父进程属于这个数据目录时一起关掉。
-        var serverPids = processName.Equals("Antigravity.exe", StringComparison.OrdinalIgnoreCase)
-            ? CursorProcesses.Enumerate("language_server.exe")
-                .Where(p => myPids.Contains(p.ParentPid))
-                .Select(p => p.Pid)
-                .ToList()
-            : new List<int>();
-
-        var windows = NativeWindows.Snapshot();
-        var killed = 0;
-        foreach (var pid in myPids)
-        {
-            var window = windows.TryGetValue(pid, out var info) ? info : default;
-
-            // 窗口已经藏起来了：WM_CLOSE 只会让它再隐藏一次，直接结束进程。
-            if (window.Visible && NativeWindows.TryCloseGracefully(pid, window.Handle, 5000))
-            {
-                killed++;
-                continue;
-            }
-
-            NativeWindows.KillTree(pid);
-            killed++;
-        }
-
-        foreach (var pid in serverPids)
-        {
-            NativeWindows.KillTree(pid);
-        }
-
-        return killed;
     }
 }

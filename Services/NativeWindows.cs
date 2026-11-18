@@ -96,7 +96,7 @@ public static class NativeWindows
     }
 
     /// <summary>
-    /// 把窗口显示出来（隐藏或最小化都能恢复）并尽力切到前台。
+    /// 把窗口显示出来（隐藏、最小化、被系统挂起都能恢复）并尽力切到前台。
     /// 只要窗口真的存在且已经显示，就返回 true；前台切换失败不算失败，
     /// 否则会被误报成「没找到窗口」。
     /// </summary>
@@ -128,6 +128,9 @@ public static class NativeWindows
         return true;
     }
 
+    /// <summary>
+    /// 按 PID 显示窗口。调用方已经有快照时请直接传句柄，不要走这里（会重新枚举一遍）。
+    /// </summary>
     public static bool TryShowAndActivate(int pid) =>
         Snapshot().TryGetValue(pid, out var window) && TryShowAndActivate(window.Handle);
 
@@ -197,9 +200,28 @@ public static class NativeWindows
         return GetWindow(hWnd, GwOwner) == IntPtr.Zero;
     }
 
-    /// <summary>可见、有标题的窗口更像主窗口。</summary>
-    private static int Rank(in WindowInfo window) =>
-        (window.Visible ? 4 : 0) + (window.Title.Length > 0 ? 2 : 0);
+    /// <summary>
+    /// 可见、有标题的窗口更像主窗口。
+    /// 标题是 Electron 默认值的辅助窗口（splash、隐藏的宿主窗口）优先级最低，
+    /// 免得把它们当成主窗口去显示。
+    /// </summary>
+    private static int Rank(in WindowInfo window)
+    {
+        var score = (window.Visible ? 4 : 0);
+        if (window.Title.Length > 0)
+        {
+            score += 2;
+        }
+
+        // Cursor / Antigravity 的窗口标题带项目名或工作区名，Codex 是 "ChatGPT"。
+        // 这些都是正常主窗口；只有空标题或纯类名残留时才降权。
+        if (window.Title.Length == 0)
+        {
+            score -= 3;
+        }
+
+        return score;
+    }
 
     private static string ReadTitle(IntPtr hWnd)
     {

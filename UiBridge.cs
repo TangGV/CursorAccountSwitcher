@@ -27,8 +27,8 @@ public sealed class UiBridge
     private readonly ProfileStore _store;
     private readonly AppPrefs _prefs;
     private readonly DispatcherTimer _statusTimer;
-    // 查进程表要走 WMI，几百毫秒到几秒不等，不能挂在界面线程上。
-    private readonly SemaphoreSlim _refreshGate = new(1, 1);
+    // 同一时刻只跑一次查询：连着点刷新、定时推送撞上手动刷新时，后来的直接复用正在进行的结果。
+    private Task<List<object>>? _inflight;
 
     public UiBridge(Window window, CoreWebView2 core)
     {
@@ -166,9 +166,22 @@ public sealed class UiBridge
         };
     }
 
+    // 安装版本信息几乎不变，但收集一次要扫注册表和开始菜单（上百毫秒）。
+    private static readonly TimeSpan VersionsCacheTtl = TimeSpan.FromMinutes(5);
+    private static (List<string> Others, DateTime Expires)? _otherVersionsCache;
+    private static readonly object VersionsCacheGate = new();
+
     private List<string> OtherVersions(AppKind app, string? chosenPath)
     {
         if (chosenPath is null) return new List<string>();
+
+        lock (VersionsCacheGate)
+        {
+            if (_otherVersionsCache is { } cached && cached.Expires > DateTime.UtcNow)
+            {
+                return cached.Others;
+            }
+        }
 
         IEnumerable<(string Path, string Version)> installs = app switch
         {
@@ -177,14 +190,20 @@ public sealed class UiBridge
             _ => CursorLocator.CollectInstalls().Select(i => (i.ExePath, i.Version)),
         };
 
-        return installs
+        var others = installs
             .Where(i => !PathsEqual(i.Path, chosenPath))
             .Select(i => i.Version)
             .Where(v => !string.IsNullOrWhiteSpace(v))
             .Distinct()
             .ToList();
-    }
 
+        lock (VersionsCacheGate)
+        {
+            _otherVersionsCache = (others, DateTime.UtcNow + VersionsCacheTtl);
+        }
+
+        return others;
+    }
     private object SetSettings(JsonElement arg)
     {
         if (arg.ValueKind == JsonValueKind.Object)
@@ -212,19 +231,32 @@ public sealed class UiBridge
                    && arg.TryGetProperty("deep", out var d)
                    && d.ValueKind == JsonValueKind.True;
 
-        // 查进程/读数据库都在后台线程做，避免界面卡住。
-        // 档案列表先在界面线程拷一份，后台线程只读这份副本。
-        var profiles = _store.Profiles.ToList();
+        return await CollectAsync(deep);
+    }
 
-        await _refreshGate.WaitAsync();
-        try
+    /// <summary>
+    /// 取账号列表。同一时刻只有一次查询在跑，后来的调用直接等同一个结果，
+    /// 所以连点刷新不会排队堆出一串几秒的查询。
+    /// </summary>
+    private Task<List<object>> CollectAsync(bool deep)
+    {
+        var inflight = _inflight;
+        if (inflight is not null)
         {
-            return await Task.Run(() => (object?)ListDtos(profiles, deep));
+            return inflight;
         }
-        finally
+
+        var profiles = _store.Profiles.ToList();
+        var task = Task.Run(() => ListDtos(profiles, deep));
+        _inflight = task;
+
+        // 任务结束后清掉句柄，下次请求才会真正重查。
+        _ = task.ContinueWith(_ =>
         {
-            _refreshGate.Release();
-        }
+            Interlocked.CompareExchange(ref _inflight, null, task);
+        }, TaskScheduler.Default);
+
+        return task;
     }
 
     private List<object> ListDtos(bool deep) => ListDtos(_store.Profiles.ToList(), deep);
@@ -233,6 +265,7 @@ public sealed class UiBridge
     {
         // 进程表和窗口表各查一次，账号数量不影响耗时。
         var snapshot = new RuntimeSnapshot();
+        var notices = CollectNotices(profiles);
 
         return profiles
             .Select((profile, index) => (profile, index))
@@ -244,8 +277,43 @@ public sealed class UiBridge
             })
             .ThenBy(x => x.profile.IsMain ? 0 : 1)
             .ThenBy(x => x.index)
-            .Select(x => ToDto(x.profile, snapshot, deep))
+            .Select(x => ToDto(x.profile, snapshot, notices, deep))
             .ToList();
+    }
+
+    /// <summary>
+    /// 读最近的通知并判断归属，返回 账号 ID → 最新一条通知。
+    ///
+    /// 为什么要在切换器里做这件事：Windows 点 toast 只会按 AUMID 拉起默认实例
+    /// （见 NotificationFeed 的说明），所以「哪条通知属于哪个账号」必须自己记，
+    /// 用户直接点卡片上的通知就能跳到正确的窗口。
+    /// </summary>
+    private static Dictionary<string, NotificationFeed.Item> CollectNotices(IReadOnlyList<AccountProfile> profiles)
+    {
+        var result = new Dictionary<string, NotificationFeed.Item>(StringComparer.OrdinalIgnoreCase);
+
+        var items = NotificationFeed.ReadRecent();
+        if (items.Count == 0)
+        {
+            return result;
+        }
+
+        foreach (var item in items)
+        {
+            var attribution = NotificationAttribution.Attribute(item, profiles);
+            if (attribution.ProfileId is null)
+            {
+                continue;
+            }
+
+            // items 按时间倒序，先到先得 = 每个账号只留最新一条。
+            if (!result.ContainsKey(attribution.ProfileId))
+            {
+                result[attribution.ProfileId] = item;
+            }
+        }
+
+        return result;
     }
 
     /// <summary>定时把状态推给前端（保持卡片上的运行状态实时）。</summary>
@@ -253,23 +321,7 @@ public sealed class UiBridge
     {
         try
         {
-            if (!await _refreshGate.WaitAsync(0))
-            {
-                // 上一次刷新还没完成，这一拍跳过。
-                return;
-            }
-
-            List<object> items;
-            var profiles = _store.Profiles.ToList();
-            try
-            {
-                items = await Task.Run(() => ListDtos(profiles, deep: false));
-            }
-            finally
-            {
-                _refreshGate.Release();
-            }
-
+            var items = await CollectAsync(deep: false);
             var json = JsonSerializer.Serialize(items, Json);
             var script = $"window.__updateList && window.__updateList({JsonSerializer.Serialize(json)});";
             await _core.ExecuteScriptAsync(script);
@@ -280,7 +332,8 @@ public sealed class UiBridge
         }
     }
 
-    private object ToDto(AccountProfile p, RuntimeSnapshot snapshot, bool deep)
+    private object ToDto(AccountProfile p, RuntimeSnapshot snapshot,
+        IReadOnlyDictionary<string, NotificationFeed.Item> notices, bool deep)
     {
         var pids = snapshot.PidsOf(p);
         var isRunning = pids.Count > 0;
@@ -322,6 +375,9 @@ public sealed class UiBridge
             membershipText = p.MembershipText,
             statusText = StatusText(p, isRunning, isHidden),
             dataDirExists = SafeExists(p.DataDir),
+            notice = notices.TryGetValue(p.Id, out var n)
+                ? new { title = n.Title, body = n.Body, at = n.Arrival.ToString("MM-dd HH:mm") }
+                : null,
         };
     }
 
@@ -430,35 +486,19 @@ public sealed class UiBridge
     }
 
     /// <summary>
-    /// 启动 Codex 副实例。商店版会忽略 --user-data-dir，窗口状态仍共享，
-    /// 但 CODEX_HOME 生效：登录、会话、配置都落在该账号自己的目录里。
+    /// 启动 Codex 副实例。登录、会话、配置通过 CODEX_HOME 隔离在这个账号自己的目录里，
+    /// 窗口数据用 --user-data-dir 指到同一个目录（商店版 26.1111+ 认这个参数）。
+    /// 归属判断也按命令行里的这个目录走，和 Cursor / Antigravity 一致。
     /// </summary>
     private async Task<object?> LaunchCodexAsync(AccountProfile profile, string exe)
     {
-        // 查进程表要走 WMI，放到后台线程，别卡住界面。
-        var existing = await Task.Run<IReadOnlyList<int>>(() => profile.IsMain
-            ? CodexInstanceTracker.UntrackedMainPids()
-            : CodexInstanceTracker.PidsFor(profile.Id)).ConfigureAwait(true);
-
-        if (existing.Count > 0)
+        var runningMessage = await TryShowRunningAsync(profile);
+        if (runningMessage is not null)
         {
-            // 进程还在（窗口可能已被关到托盘），只做恢复显示，不开新窗口。
-            var shown = await Task.Run(() => CodexInstanceTracker.TryActivate(existing)).ConfigureAwait(true);
-
-            return new
-            {
-                message = shown
-                    ? $"「{profile.Name}」已经在运行，已切换到它的窗口。"
-                    : $"「{profile.Name}」的进程还在后台运行，但没找到窗口。可以先关掉它再重新启动。",
-            };
+            return new { message = runningMessage };
         }
 
         PrepareDataDir(profile);
-
-        var before = await Task.Run(() => CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
-            .Where(p => p.IsInstance)
-            .Select(p => p.Pid)
-            .ToHashSet()).ConfigureAwait(true);
 
         try
         {
@@ -474,41 +514,8 @@ public sealed class UiBridge
             throw new InvalidOperationException("启动失败：" + ex.Message);
         }
 
-        if (!profile.IsMain)
-        {
-            var started = await WaitForNewCodexMainAsync(before);
-            if (started is int pid)
-            {
-                CodexInstanceTracker.Record(profile.Id, pid);
-            }
-        }
-
         await Task.Delay(1200);
         return new { message = $"正在启动「{profile.Name}」…" };
-    }
-
-    /// <summary>
-    /// 等新的 Codex 主进程出现，并把它记成这个副账号的实例。
-    /// 命令行里没有数据目录可核对，所以启动时先记下已有 PID，只认新出现的那个。
-    /// </summary>
-    private static async Task<int?> WaitForNewCodexMainAsync(HashSet<int> before)
-    {
-        for (var i = 0; i < 20; i++)
-        {
-            await Task.Delay(400);
-
-            var started = await Task.Run(() => CursorProcesses.Enumerate(AppCatalog.ProcessName(AppKind.Codex))
-                .Where(p => p.IsInstance && !before.Contains(p.Pid))
-                .Select(p => p.Pid)
-                .FirstOrDefault()).ConfigureAwait(true);
-
-            if (started > 0)
-            {
-                return started;
-            }
-        }
-
-        return null;
     }
 
     /// <summary>Codex 副账号的进程环境：只换 CODEX_HOME。</summary>
@@ -647,9 +654,14 @@ public sealed class UiBridge
     }
 
     /// <summary>
-    /// 结束某个账号的实例。只发 WM_CLOSE 不够：Electron 应用关窗口多半只是隐藏到托盘，
-    /// 进程会一直挂着，卡片就永远显示「运行中」。所以先礼后刀，进程没退就强杀整棵进程树。
-    /// 返回是否真的找到了实例。
+    /// 结束某个账号的实例。返回是否真的找到了实例。
+    ///
+    /// 三种应用的退出行为不一样，实测结果：
+    ///   - Cursor / Antigravity（VS Code）：窗口可见时发 WM_CLOSE 会走正常退出，有未保存内容会弹提示。
+    ///     窗口隐藏时先显示出来再发，否则它只会再隐藏一次。
+    ///   - Codex 桌面版：完全不响应 WM_CLOSE（隐藏态、显示态、taskkill 不带 /F 都试过，
+    ///     一律当成「隐藏到托盘」），只能结束进程树。它是对话应用，没有未保存文件，
+    ///     强杀代价可接受，所以只给它很短的时间窗口、避免用户白等。
     /// </summary>
     private async Task<bool> CloseInstanceAsync(AccountProfile profile) =>
         await Task.Run(() =>
@@ -661,30 +673,43 @@ public sealed class UiBridge
                 return false;
             }
 
-            if (profile.App == AppKind.Codex)
+            var gracefulWait = profile.App == AppKind.Codex ? 1500 : 6000;
+
+            foreach (var pid in pids)
             {
-                foreach (var pid in pids)
+                var window = snapshot.TryGetWindow(pid, out var info) ? info : default;
+
+                if (window.Handle == IntPtr.Zero)
                 {
-                    var window = snapshot.TryGetWindow(pid, out var info) ? info : default;
-
-                    // 窗口已经藏起来了：WM_CLOSE 只会让它再隐藏一次，直接结束进程。
-                    if (window.Visible && NativeWindows.TryCloseGracefully(pid, window.Handle, 4000))
-                    {
-                        continue;
-                    }
-
                     NativeWindows.KillTree(pid);
+                    continue;
                 }
 
-                if (!profile.IsMain)
+                // 隐藏的窗口先叫出来：WM_CLOSE 对隐藏窗口多半无效，
+                // 而且用户也看不到可能弹出的保存提示。
+                // Codex 不响应 WM_CLOSE，显示出来只会闪一下，跳过。
+                if (!window.Visible && profile.App != AppKind.Codex)
                 {
-                    CodexInstanceTracker.Forget(profile.Id);
+                    NativeWindows.TryShowAndActivate(window.Handle);
                 }
 
-                return true;
+                if (NativeWindows.TryCloseGracefully(pid, window.Handle, gracefulWait))
+                {
+                    continue;
+                }
+
+                NativeWindows.KillTree(pid);
             }
 
-            InstanceService.CloseProcesses(profile.DataDir, DefaultDir(profile), AppCatalog.ProcessName(profile.App));
+            // Antigravity 的语言服务是另一个进程，主进程走了它可能还占着目录。
+            if (profile.App == AppKind.Antigravity)
+            {
+                foreach (var pid in snapshot.LanguageServerPids(pids))
+                {
+                    NativeWindows.KillTree(pid);
+                }
+            }
+
             return true;
         }).ConfigureAwait(true);
 
@@ -845,7 +870,32 @@ public sealed class UiBridge
 
     private readonly record struct LocatedInstall(string Path, string Version);
 
+    // 安装位置在一台机器上几乎不变，扫注册表和开始菜单要几百毫秒，缓存一会儿。
+    private static readonly TimeSpan InstallCacheTtl = TimeSpan.FromMinutes(2);
+    private static readonly Dictionary<AppKind, (LocatedInstall? Install, DateTime Expires)> InstallCache = new();
+    private static readonly object InstallCacheGate = new();
+
     private static LocatedInstall? FindInstall(AppKind app)
+    {
+        lock (InstallCacheGate)
+        {
+            if (InstallCache.TryGetValue(app, out var cached) && cached.Expires > DateTime.UtcNow)
+            {
+                return cached.Install;
+            }
+        }
+
+        var found = LocateInstall(app);
+
+        lock (InstallCacheGate)
+        {
+            InstallCache[app] = (found, DateTime.UtcNow + InstallCacheTtl);
+        }
+
+        return found;
+    }
+
+    private static LocatedInstall? LocateInstall(AppKind app)
     {
         switch (app)
         {

@@ -15,8 +15,10 @@ Cursor 默认只记一个登录态。想同时用「公司号」和「个人号�
 | 功能 | 说明 |
 |---|---|
 | 多实例并行 | 每个账号一个独立数据目录，可同时运行 |
-| 状态识别 | 从 `state.vscdb` 读邮箱与订阅类型，实时显示运行状态 |
+| 状态识别 | 从 `state.vscdb` / `auth.json` 读邮箱与订阅类型，实时显示运行状态 |
 | 打开 / 重启 / 关闭 | 账号在跑时卡片上直接给出三个按钮：打开窗口、重启实例、关闭进程 |
+| 后台态识别 | 关窗口只是隐藏到托盘时显示「已在后台」，不再误报成运行中 |
+| 通知归属 | 系统通知不区分实例，切换器自己判断每条通知属于哪个账号，卡片上直接跳到正确窗口 |
 | Agent 面板启动 | 默认 `--glass`，启动即进入对话界面；可切换成编辑器窗口 |
 | 设置同步 | 把主账号的 `settings.json` / 快捷键 / 片段复制到其他账号，哈希保护防止覆盖你自己的改动 |
 | 会话同步 | 白名单同步最近项目、终端历史等 UI 状态，**绝不触碰 `cursorAuth/*` 凭证** |
@@ -87,12 +89,13 @@ Services/
   CursorProcesses.cs        枚举进程、解析 --user-data-dir、判断归属
   NativeWindows.cs          枚举顶层窗口（隐藏到托盘的也能找到）、显示窗口、WM_CLOSE
   RuntimeSnapshot.cs        一次查完进程表与窗口表，供所有账号复用
-  InstanceService.cs        启动 / 关闭实例
-  WindowActivator.cs        Win32 窗口激活
-  StateDbReader.cs          只读 state.vscdb 取 Cursor 登录信息
+  InstanceService.cs        启动实例
+  WindowActivator.cs        Win32 窗口前置
+  StateDbReader.cs          只读 state.vscdb 取 Cursor 登录信息、按文本反查会话
   AntigravityLoginReader.cs 读 app_storage.json 取 Antigravity 登录名
   CodexLoginReader.cs       解析 auth.json 的 id_token 取 Codex 邮箱与套餐
-  CodexInstanceTracker.cs   记录 Codex 副实例 PID（命令行不带数据目录）
+  NotificationFeed.cs       读 Windows 通知库，取最近的应用通知
+  NotificationAttribution.cs 判断通知属于哪个账号（会话标题 / 活跃时间）
   SettingsSync.cs           设置文件同步（哈希保护）
   SessionSync.cs            UI 状态同步（白名单）
   ProfileStore.cs           账号档案 JSON 持久化
@@ -111,14 +114,51 @@ Models/AppKind.cs           应用枚举与 JSON 转换
 
 ## Codex 多账号
 
-Codex 桌面版由 Microsoft Store 分发，会忽略 `--user-data-dir`，窗口状态只能共享。副账号
-通过 `CODEX_HOME` 隔离登录、会话与配置，主账号继续用 `~\.codex`。由于它的命令行里不带
-数据目录，切换器在启动时记下新出现的进程，用来判断某个副账号是否还在运行；从开始菜单
-另开的窗口会被当成主账号。
+Codex 桌面版由 Microsoft Store 分发。副账号启动时同时设置 `CODEX_HOME`（登录、会话、配置）
+和 `--user-data-dir`（窗口数据），两者都指向该账号自己的目录。主账号继续用 `~\.codex`。
 
-关掉 Codex 的窗口时进程往往还在后台（托盘图标仍在），卡片会显示「已在后台 · 窗口已关闭」。
-这时「打开」能把窗口重新叫出来，「关闭」会先发 WM_CLOSE、几秒内没退出就结束整棵进程树，
-所以不会再出现「已经退出了却还显示切换过去」。
+> 早期版本以为商店版忽略 `--user-data-dir`、命令行里不带数据目录，于是靠「启动时记下新出现的
+> PID」来猜归属。实测 26.1111+ 的主进程命令行明确带 `--user-data-dir=<CODEX_HOME>`，
+> 所以现在和 Cursor / Antigravity 用同一套命令行归属判断，异常退出也不会留下导致卡片卡住的假记录。
+
+**Codex 不响应 WM_CLOSE**。实测隐藏态、显示态、`taskkill` 不带 `/F`、向所有顶层窗口发 WM_CLOSE
+都没能让它退出——它把关闭一律当成「隐藏到托盘」。所以「关闭」对 Codex 是结束进程树
+（它是对话应用，没有未保存文件，代价可接受），对话框里也会明说。Cursor / Antigravity 是
+VS Code，窗口可见时 WM_CLOSE 会正常退出（实测 2 秒内），有未保存内容会弹提示；窗口隐藏时
+会先叫出来再关，避免看不到保存提示。
+
+卡片状态按窗口可见性区分：进程在但窗口不可见时显示「已在后台 · 窗口已关闭」，圆点变黄，
+这时「打开」能把窗口重新叫出来。
+
+## 通知与多实例
+
+**系统通知点不进正确的账号**，这是应用本身的限制，不是切换器的 bug：
+
+```
+Windows 通知库里的处理器
+  handler 174  AUMID = Anysphere.Cursor      ← 所有 Cursor 实例共用同一个
+HKCU\Software\Classes\CLSID\{E058B543-…}
+  = "Electron Notification Activator"
+  LocalServer32 = C:\Program Files\Cursor\Cursor.exe   ← 不带任何参数
+```
+
+点击 toast 时 Windows 按 AUMID 找到这个 COM 激活器，用**不带参数**的 exe 去激活，
+于是必然打开默认数据目录那个实例（也就是主账号）。AUMID 由应用内部硬编码，外部改不了；
+改注册表会劫持 `cursor://` 协议、影响整台机器上所有通知，所以不做。
+
+切换器的做法是自己记归属：读 Windows 通知库里最近 24 小时的通知，判断每条属于哪个账号，
+在对应卡片上显示「最近通知」一行。点这一行会跳到正确的窗口，不需要经过系统 toast。
+
+归属判断有两条依据：
+
+| 依据 | 适用 | 说明 |
+|---|---|---|
+| 会话标题反查 | Cursor | 通知正文第一行是会话名，在哪个账号的 `state.vscdb` 里找得到就属于谁 |
+| 活跃时间 | Antigravity / Codex / 标题未落库 | 比较各账号数据目录的最近写入时间与通知到达时间 |
+
+判断不出来时**不显示通知行**，而不是猜一个账号——指错比不指更糟。Antigravity 的会话名
+不落盘（正文也只有固定文案），所以它主要靠活跃时间；超过 30 分钟的通知不再按时间判断，
+因为那时的活跃状态说明不了现在。
 
 ## License
 

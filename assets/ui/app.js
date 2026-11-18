@@ -35,11 +35,17 @@ window.__updateList = function (json) {
     incoming.every((a, i) => accounts[i] && accounts[i].id === a.id);
 
   // 运行 / 后台状态变了，卡片上的按钮组也要跟着变，同样整体重绘。
+  // 不重绘的话，进程刚好在两拍之间退出时，卡片会一直挂着「打开 / 重启 / 关闭」。
+  // 通知变了也重绘：卡片上会多出一条通知行。
   const sameFlags =
     sameShape &&
-    incoming.every((a, i) =>
-      !!a.isRunning === !!accounts[i].isRunning &&
-      !!a.isHidden === !!accounts[i].isHidden);
+    incoming.every((a, i) => {
+      const prev = accounts[i];
+      return !!a.isRunning === !!prev.isRunning
+        && !!a.isHidden === !!prev.isHidden
+        && (a.notice ? a.notice.title : '') === (prev.notice ? prev.notice.title : '')
+        && (a.notice ? a.notice.at : '') === (prev.notice ? prev.notice.at : '');
+    });
 
   accounts = incoming;
 
@@ -60,10 +66,18 @@ window.__updateList = function (json) {
     if (statusEl && statusEl.textContent !== a.statusText) statusEl.textContent = a.statusText;
 
     const emailEl = card.querySelector('.email');
-    if (emailEl && emailEl.textContent !== a.displayEmail) {
+    if (emailEl && (emailEl.textContent !== a.displayEmail || emailEl.title !== a.displayEmail)) {
       emailEl.textContent = a.displayEmail;
       emailEl.title = a.displayEmail;
     }
+
+    // 会员标签也可能变（登录后刷新），顺手对齐。
+    const planEl = card.querySelector('.tag.plan');
+    if (a.membershipText && !planEl) {
+      render();
+      return;
+    }
+    if (planEl && planEl.textContent !== a.membershipText) planEl.textContent = a.membershipText;
   }
 
   renderStats();
@@ -161,10 +175,6 @@ function renderStats() {
 
 function cardHtml(a) {
   const [bg, fg] = colorFor(a.name);
-  const cls = ['card'];
-  if (a.isRunning) cls.push('running');
-  if (a.isHidden) cls.push('background');
-  if (a.isRunning && !a.hasLogin) cls.push('unlogged');
 
   const planTag = a.membershipText
     ? `<span class="tag plan">${escapeHtml(a.membershipText)}</span>`
@@ -180,6 +190,23 @@ function cardHtml(a) {
     : `
         <button class="btn mini primary btn-launch" data-act="launch" data-id="${escapeHtml(a.id)}">启动</button>`;
 
+  // 最近一条属于这个账号的通知。Windows 自己点 toast 会拉起默认实例，
+  // 所以这里直接给一个能跳到正确账号的入口。
+  const notice = a.notice
+    ? `<button class="notice" data-act="open" data-id="${escapeHtml(a.id)}"
+         title="${escapeHtml(a.notice.body || a.notice.title)}">
+         <span class="notice-dot"></span>
+         <span class="notice-title">${escapeHtml(a.notice.title)}</span>
+         <span class="notice-at">${escapeHtml(a.notice.at)}</span>
+       </button>`
+    : '';
+
+  const cls = ['card'];
+  if (a.isRunning) cls.push('running');
+  if (a.isHidden) cls.push('background');
+  if (a.isRunning && !a.hasLogin) cls.push('unlogged');
+  if (a.notice) cls.push('has-notice');
+
   return `
     <div class="${cls.join(' ')}" data-id="${escapeHtml(a.id)}">
       <div class="avatar" style="background:${bg}2e;color:${fg}">
@@ -193,6 +220,7 @@ function cardHtml(a) {
         </div>
         <div class="email" title="${escapeHtml(a.displayEmail)}">${escapeHtml(a.displayEmail)}</div>
         <div class="status"><span class="dot"></span><span>${escapeHtml(a.statusText)}</span></div>
+        ${notice}
       </div>
       <div class="actions">
         ${buttons}
@@ -504,9 +532,14 @@ async function doLaunch(account) {
 
 async function doClose(account) {
   if (!account) return;
+  // Codex 不响应 WM_CLOSE（实测关窗口只隐藏到托盘），只能结束进程，
+  // 所以提示语不能说「有机会保存」。
+  const isCodex = account.app === 'codex';
   const r = await showModal({
     title: `关闭「${account.name}」的实例？`,
-    desc: '会先请求它自己退出，没保存的内容有机会保存；如果几秒内没退出，就直接结束进程。',
+    desc: isCodex
+      ? 'Codex 关窗口只是隐藏到托盘，不会真的退出，所以这里会直接结束它的进程。'
+      : '会先请求它自己退出，没保存的内容有机会保存；如果几秒内没退出，就直接结束进程。',
     choices: [{ label: '关闭实例' }, { label: '取消' }],
     okText: '继续',
   });
@@ -526,15 +559,25 @@ async function doOpen(account) {
     const res = await host('open', { id: account.id });
     if (res && res.message) toast(res.message);
   } catch (err) {
-    toast(String(err.message || err), true);
+    const msg = String(err.message || err);
+    // 点通知时实例可能已经退出了（Codex 关窗口只是藏起来，但也可能真的被关掉）。
+    // 这种情况下直接拉起来，别让用户看到一个「没在运行」的死胡同。
+    if (msg.includes('没有在运行')) {
+      await doLaunch(account);
+      return;
+    }
+    toast(msg, true);
   }
 }
 
 async function doRestart(account) {
   if (!account) return;
+  const isCodex = account.app === 'codex';
   const r = await showModal({
     title: `重启「${account.name}」的实例？`,
-    desc: '先关掉现在这个进程，再按当前设置重新启动。没保存的内容会先尝试保存。',
+    desc: isCodex
+      ? '先结束现在的进程，再按当前设置重新启动。'
+      : '先关掉现在这个进程（有未保存内容会先提示保存），再按当前设置重新启动。',
     choices: [{ label: '重启' }, { label: '取消' }],
     okText: '继续',
   });

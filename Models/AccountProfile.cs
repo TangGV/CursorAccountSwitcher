@@ -1,29 +1,20 @@
-using System.ComponentModel;
-using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 
 namespace CursorAccountSwitcher.Models;
 
 /// <summary>
-/// 一个 Cursor 账号档案。Main 使用默认数据目录，其余各自使用独立数据目录。
+/// 一个账号档案。Main 使用默认数据目录，其余各自使用独立数据目录。
+///
+/// 运行状态不放在这里：它由 <c>RuntimeSnapshot</c> 每次查询得到，
+/// 界面上要展示的字段统一在 UiBridge 里组装成 DTO。
 /// </summary>
-public sealed class AccountProfile : INotifyPropertyChanged
+public sealed class AccountProfile
 {
-    private string _name = string.Empty;
-    private string? _cachedEmail;
-    private string? _membership;
-    private bool _isRunning;
-    private int _processCount;
-
     /// <summary>稳定的内部标识，用于定位注册表记录与快捷方式。</summary>
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
 
     /// <summary>显示名，例如「公司号」「个人号」。</summary>
-    public string Name
-    {
-        get => _name;
-        set => SetField(ref _name, value);
-    }
+    public string Name { get; set; } = string.Empty;
 
     /// <summary>该档案的数据目录绝对路径。Main 为 %APPDATA%\Cursor。</summary>
     public string DataDir { get; set; } = string.Empty;
@@ -42,18 +33,7 @@ public sealed class AccountProfile : INotifyPropertyChanged
     public string? HomeDir { get; set; }
 
     /// <summary>上次从该数据目录读到的登录邮箱，仅作展示与判断是否已登录。</summary>
-    public string? CachedEmail
-    {
-        get => _cachedEmail;
-        set
-        {
-            if (SetField(ref _cachedEmail, value))
-            {
-                OnPropertyChanged(nameof(DisplayEmail));
-                OnPropertyChanged(nameof(HasLogin));
-            }
-        }
-    }
+    public string? CachedEmail { get; set; }
 
     /// <summary>
     /// 上次同步写入该账号设置文件的哈希（文件名 -> SHA256）。
@@ -62,31 +42,7 @@ public sealed class AccountProfile : INotifyPropertyChanged
     public Dictionary<string, string> SyncedHashes { get; set; } = new();
 
     /// <summary>订阅类型（free / pro / ultra 等），仅作展示。</summary>
-    public string? Membership
-    {
-        get => _membership;
-        set
-        {
-            if (SetField(ref _membership, value))
-            {
-                OnPropertyChanged(nameof(MembershipText));
-            }
-        }
-    }
-
-    [JsonIgnore]
-    public bool IsRunning
-    {
-        get => _isRunning;
-        set => SetField(ref _isRunning, value);
-    }
-
-    [JsonIgnore]
-    public int ProcessCount
-    {
-        get => _processCount;
-        set => SetField(ref _processCount, value);
-    }
+    public string? Membership { get; set; }
 
     [JsonIgnore]
     public string DisplayEmail => string.IsNullOrWhiteSpace(CachedEmail) ? "尚未登录" : CachedEmail!;
@@ -97,36 +53,4 @@ public sealed class AccountProfile : INotifyPropertyChanged
     [JsonIgnore]
     public string MembershipText =>
         HasLogin && !string.IsNullOrWhiteSpace(Membership) ? Membership!.ToUpperInvariant() : "";
-
-    [JsonIgnore]
-    public string StatusText => IsRunning
-        ? (HasLogin ? "运行中" : "运行中 · 未登录")
-        : (HasLogin ? "已登录 · 未启动" : "未登录");
-
-    /// <summary>主按钮文字：没启动时是「启动」，已在跑时是「切换过去」。</summary>
-    [JsonIgnore]
-    public string LaunchButtonText => IsRunning ? "切换过去" : "启动";
-
-    public void RefreshStatusText()
-    {
-        OnPropertyChanged(nameof(StatusText));
-        OnPropertyChanged(nameof(LaunchButtonText));
-    }
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-
-    private bool SetField<T>(ref T field, T value, [CallerMemberName] string? name = null)
-    {
-        if (EqualityComparer<T>.Default.Equals(field, value))
-        {
-            return false;
-        }
-
-        field = value;
-        OnPropertyChanged(name);
-        return true;
-    }
-
-    private void OnPropertyChanged(string? name) =>
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }

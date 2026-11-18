@@ -4,7 +4,9 @@ namespace CursorAccountSwitcher;
 
 public partial class App : Application
 {
-    private const string MutexName = @"Global\CursorAccountSwitcher.SingleInstance";
+    // 用 Local\ 而不是 Global\：多用户 / 远程会话各开一份互不影响，
+    // Global\ 会让同一台机器上第二个用户完全打不开。
+    private const string MutexName = @"Local\CursorAccountSwitcher.SingleInstance";
 
     private Mutex? _mutex;
 

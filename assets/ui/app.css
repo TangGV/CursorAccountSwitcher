@@ -311,6 +311,54 @@ html, body {
   color: var(--text-mute);
 }
 
+/* 卡片上的「最近通知」：Windows 点 toast 只会拉起默认实例，
+   所以这里给一个能跳到正确账号的入口。 */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  max-width: 100%;
+  padding: 4px 8px 4px 7px;
+  border: 1px solid rgba(110, 155, 255, 0.28);
+  border-radius: 6px;
+  background: rgba(110, 155, 255, 0.10);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+.notice:hover {
+  background: rgba(110, 155, 255, 0.18);
+  border-color: rgba(110, 155, 255, 0.5);
+  color: var(--text);
+}
+
+.notice-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.notice-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notice-at {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--text-mute);
+}
+
 .dot {
   width: 6px;
   height: 6px;
